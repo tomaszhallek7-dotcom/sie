@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { parseCapacityInfo, parseGpuParam } from "../src/internal/parsing.js";
+import { handleError, parseCapacityInfo, parseGpuParam } from "../src/internal/parsing.js";
 import { computeBackoffWithJitter, getRetryAfter } from "../src/internal/retry.js";
 
 describe("Retry logic - exponential backoff with jitter", () => {
@@ -222,6 +222,99 @@ describe("Real-world retry scenarios", () => {
     // This should take precedence over computed backoff
     const computedDelay = computeBackoffWithJitter(0, 1000, 30000);
     expect(serverHint).toBeGreaterThan(computedDelay);
+  });
+});
+
+describe("handleError (gateway / FastAPI bodies)", () => {
+  it("reads nested FastAPI-style detail (gateway 4xx/5xx)", async () => {
+    const res = new Response(
+      JSON.stringify({
+        detail: { code: "MODEL_NOT_FOUND", message: "Model 'x' not found" },
+      }),
+      { status: 404, headers: { "Content-Type": "application/json" } },
+    );
+    await expect(handleError(res)).rejects.toMatchObject({
+      name: "RequestError",
+      message: "Model 'x' not found",
+      code: "MODEL_NOT_FOUND",
+      statusCode: 404,
+    });
+  });
+
+  it("reads top-level message for 202 provisioning (no detail object)", async () => {
+    const res = new Response(
+      JSON.stringify({
+        status: "provisioning",
+        gpu: "l4",
+        bundle: "default",
+        estimated_wait_s: 30,
+        message: "No worker available for GPU type 'l4'. Provisioning in progress.",
+      }),
+      {
+        status: 202,
+        headers: { "Content-Type": "application/json", "Retry-After": "5" },
+      },
+    );
+    await expect(handleError(res, "l4")).rejects.toMatchObject({
+      name: "ProvisioningError",
+      message: "No worker available for GPU type 'l4'. Provisioning in progress.",
+      gpu: "l4",
+      retryAfter: 5000,
+    });
+  });
+
+  it("parses HTTP-date Retry-After for 202 provisioning", async () => {
+    const retryAt = new Date(Date.now() + 60_000).toUTCString();
+    const res = new Response(
+      JSON.stringify({
+        status: "provisioning",
+        message: "Provisioning in progress.",
+      }),
+      {
+        status: 202,
+        headers: { "Content-Type": "application/json", "Retry-After": retryAt },
+      },
+    );
+
+    try {
+      await handleError(res, "l4");
+      throw new Error("expected handleError to throw");
+    } catch (err) {
+      expect(err).toMatchObject({
+        name: "ProvisioningError",
+        message: "Provisioning in progress.",
+        gpu: "l4",
+      });
+      expect((err as { retryAfter?: number }).retryAfter).toBeGreaterThan(0);
+      expect((err as { retryAfter?: number }).retryAfter).toBeLessThanOrEqual(60_000);
+    }
+  });
+
+  it("reads SDK-style error object (503)", async () => {
+    const res = new Response(
+      JSON.stringify({
+        error: { code: "MODEL_LOADING", message: "Model is loading" },
+      }),
+      { status: 503, headers: { "Content-Type": "application/json" } },
+    );
+    await expect(handleError(res)).rejects.toMatchObject({
+      name: "ServerError",
+      message: "Model is loading",
+      code: "MODEL_LOADING",
+      statusCode: 503,
+    });
+  });
+
+  it("supports legacy string detail", async () => {
+    const res = new Response(JSON.stringify({ detail: "Not allowed" }), {
+      status: 403,
+      headers: { "Content-Type": "application/json" },
+    });
+    await expect(handleError(res)).rejects.toMatchObject({
+      name: "RequestError",
+      message: "Not allowed",
+      statusCode: 403,
+    });
   });
 });
 

@@ -293,6 +293,7 @@ class PaddleOCRVLAdapter(BaseAdapter):
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
                     num_beams=num_beams,
+                    use_cache=True,
                 )
 
             generated_ids = output_ids[0, prompt_len:]
@@ -344,6 +345,7 @@ class PaddleOCRVLAdapter(BaseAdapter):
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 num_beams=num_beams,
+                use_cache=True,
             )
 
         generated_ids = output_ids[0, prompt_len:]

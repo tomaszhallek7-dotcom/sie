@@ -2,14 +2,18 @@ mod config;
 mod discovery;
 mod error;
 mod handlers;
+mod health_mode;
+mod http_error;
 mod metrics;
 mod middleware;
 mod nats;
+mod openapi;
 mod queue;
 mod server;
 mod state;
 mod types;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,6 +26,7 @@ use config::Config;
 use discovery::nats_health::NatsHealthManager;
 use discovery::static_discovery::StaticDiscovery;
 use discovery::ws_health::WsHealthManager;
+use health_mode::{health_mode_disposition, HealthModeDisposition};
 use nats::manager::NatsManager;
 use queue::payload_store::create_payload_store;
 use server::AppState;
@@ -86,6 +91,10 @@ enum Commands {
         #[arg(long)]
         models_dir: Option<String>,
     },
+    Openapi {
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+    },
     Version,
 }
 
@@ -96,6 +105,12 @@ async fn main() {
     match cli.command {
         Commands::Version => {
             println!("sie-gateway {} (rust)", VERSION);
+        }
+        Commands::Openapi { output } => {
+            if let Err(e) = openapi::write_openapi_json(output.as_deref()) {
+                eprintln!("failed to export OpenAPI spec: {e}");
+                std::process::exit(1);
+            }
         }
         Commands::Serve {
             port,
@@ -289,47 +304,61 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Set up health manager based on mode
+    // Set up health manager based on mode. WebSocket health is the supported
+    // product path; NATS health is an internal/experimental consumer until
+    // workers publish `sie.health.>` by default.
+    //
+    // Core NATS subscriptions are resumed by the client on reconnect; do not spawn
+    // duplicate `NatsHealthManager::start` loops on `reconnect_notify` (see PR review).
     let mut ws_manager: Option<Arc<WsHealthManager>> = None;
     let mut nats_health_manager: Option<Arc<NatsHealthManager>> = None;
     let mut use_ws = true;
 
-    if config.health_mode == "nats" && !config.nats_url.is_empty() {
-        if let Some(client) = nats_manager.get_client().await {
-            info!("using NATS health mode (shared connection)");
-            let nats_mgr = Arc::new(NatsHealthManager::new(Arc::clone(&registry)));
-            match nats_mgr.start(&client).await {
-                Ok(()) => {
-                    nats_mgr.start_heartbeat_loop().await;
+    let nats_url_nonempty = !config.nats_url.is_empty();
+    let nats_client_available = nats_manager.get_client().await.is_some();
+    let disposition = health_mode_disposition(
+        config.health_mode.as_str(),
+        nats_url_nonempty,
+        nats_client_available,
+    );
 
-                    // Reconnect listener: re-subscribe health on NATS reconnect
-                    let nats_mgr_for_reconnect = Arc::clone(&nats_mgr);
-                    let reconnect = nats_manager.reconnect_notify();
-                    let nats_mgr_client_source = Arc::clone(&nats_manager);
-                    tokio::spawn(async move {
-                        loop {
-                            reconnect.notified().await;
-                            info!("NATS reconnected — re-subscribing health");
-                            if let Some(client) = nats_mgr_client_source.get_client().await {
-                                if let Err(e) = nats_mgr_for_reconnect.start(&client).await {
-                                    tracing::warn!(error = %e, "failed to re-subscribe health on reconnect");
-                                }
-                            }
-                        }
-                    });
-
-                    nats_health_manager = Some(nats_mgr);
-                    use_ws = false;
-                    info!("NATS health manager started");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to start NATS health manager, falling back to WS");
-                }
-            }
-        } else {
+    match disposition {
+        HealthModeDisposition::WebSocketDefault => {}
+        HealthModeDisposition::FallbackWebSocketMissingNatsUrl => {
+            tracing::warn!(
+                "NATS health mode requested but SIE_NATS_URL is not configured; falling back to WS"
+            );
+        }
+        HealthModeDisposition::FallbackWebSocketNoNatsClient => {
             tracing::warn!(
                 "NATS health mode requested but client not available, falling back to WS"
             );
+        }
+        HealthModeDisposition::FallbackWebSocketUnsupported => {
+            tracing::warn!(
+                mode = %config.health_mode,
+                "unsupported gateway health mode requested; falling back to WS"
+            );
+        }
+        HealthModeDisposition::TryNatsExperimental => {
+            tracing::warn!(
+                "NATS health mode is experimental/internal and requires workers to publish sie.health.>; if no publisher exists, the worker registry can remain empty"
+            );
+            if let Some(client) = nats_manager.get_client().await {
+                info!("using NATS health mode (shared connection)");
+                let nats_mgr = Arc::new(NatsHealthManager::new(Arc::clone(&registry)));
+                match nats_mgr.start(&client).await {
+                    Ok(()) => {
+                        nats_mgr.start_heartbeat_loop().await;
+                        nats_health_manager = Some(nats_mgr);
+                        use_ws = false;
+                        info!("NATS health manager started");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to start NATS health manager, falling back to WS");
+                    }
+                }
+            }
         }
     }
 

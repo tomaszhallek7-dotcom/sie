@@ -1,5 +1,96 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
+
+/// Fields mirrored from model YAML for ``/v1/models`` wire parity with
+/// ``sie_server`` ``ModelInfo`` (inputs, outputs, dims, profiles, …).
+#[derive(Debug, Clone, Default)]
+pub struct ModelInfoExtras {
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    pub dims: HashMap<String, i64>,
+    pub max_sequence_length: Option<u64>,
+}
+
+impl ModelInfoExtras {
+    /// Best-effort extraction from a raw model YAML document (same files as
+    /// ``sie_server`` / ``sie-config``). Missing sections fall back to
+    /// conservative defaults so the JSON shape stays valid.
+    pub fn from_yaml_raw(raw: &serde_yaml::Value) -> Self {
+        let mut extras = Self::default();
+
+        if let serde_yaml::Value::Mapping(m) = raw.get("inputs").unwrap_or(&serde_yaml::Value::Null)
+        {
+            for (k, v) in m {
+                let Some(ks) = k.as_str() else {
+                    continue;
+                };
+                if matches!(v, serde_yaml::Value::Bool(true)) {
+                    extras.inputs.push(ks.to_string());
+                }
+            }
+        }
+        if extras.inputs.is_empty() {
+            extras.inputs.push("text".to_string());
+        }
+
+        extras.max_sequence_length = raw.get("max_sequence_length").and_then(|v| v.as_u64());
+
+        let tasks = raw.get("tasks");
+        if let Some(enc) = tasks.and_then(|t| match t.get("encode")? {
+            serde_yaml::Value::Mapping(m) => Some(m),
+            _ => None,
+        }) {
+            for (k, v) in enc {
+                let Some(key) = k.as_str() else {
+                    continue;
+                };
+                if key.is_empty() {
+                    continue;
+                }
+                match v {
+                    serde_yaml::Value::Mapping(vm) => {
+                        if let Some(dim) = vm.get("dim").and_then(|d| {
+                            d.as_u64().or_else(|| d.as_i64().map(|i| i.max(0) as u64))
+                        }) {
+                            extras.dims.insert(key.to_string(), dim as i64);
+                            extras.outputs.push(key.to_string());
+                        } else if !vm.is_empty() {
+                            extras.outputs.push(key.to_string());
+                        }
+                    }
+                    serde_yaml::Value::Null => {}
+                    _ => {
+                        extras.outputs.push(key.to_string());
+                    }
+                }
+            }
+        }
+
+        let tasks_absent_or_empty = match tasks {
+            None | Some(serde_yaml::Value::Null) => true,
+            Some(serde_yaml::Value::Mapping(m)) => m.is_empty(),
+            _ => false,
+        };
+        if extras.outputs.is_empty() && tasks_absent_or_empty {
+            extras.outputs.push("dense".to_string());
+        }
+
+        extras
+    }
+
+    pub fn from_model_config(config: &ModelConfig) -> Self {
+        match serde_yaml::to_value(config) {
+            Ok(v) => Self::from_yaml_raw(&v),
+            Err(_) => Self {
+                inputs: vec!["text".to_string()],
+                outputs: vec!["dense".to_string()],
+                dims: HashMap::new(),
+                max_sequence_length: config.max_sequence_length,
+            },
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelConfig {
@@ -11,6 +102,14 @@ pub struct ModelConfig {
     pub default_bundle: Option<String>,
     #[serde(default)]
     pub profiles: HashMap<String, ProfileConfig>,
+    /// Model YAML ``inputs:`` map (e.g. ``text: true``).
+    #[serde(default)]
+    pub inputs: Option<HashMap<String, bool>>,
+    #[serde(default)]
+    pub max_sequence_length: Option<u64>,
+    /// Full ``tasks:`` tree from YAML (encode outputs / dims).
+    #[serde(default)]
+    pub tasks: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -34,6 +133,29 @@ pub struct ModelEntry {
     pub adapter_modules: HashSet<String>,
     pub profile_names: HashSet<String>,
     pub profile_configs: HashMap<String, CanonicalProfile>,
+    pub info_extras: ModelInfoExtras,
+}
+
+impl ModelEntry {
+    /// JSON shaped like ``sie_server.api.models.ModelInfo`` for HTTP clients.
+    pub fn to_model_info_value(&self, loaded: bool) -> Value {
+        let state = if loaded { "loaded" } else { "available" };
+        let mut profiles = Map::new();
+        for pname in &self.profile_names {
+            profiles.insert(pname.clone(), json!({ "is_default": pname == "default" }));
+        }
+        json!({
+            "name": self.name,
+            "inputs": self.info_extras.inputs,
+            "outputs": self.info_extras.outputs,
+            "dims": self.info_extras.dims,
+            "loaded": loaded,
+            "state": state,
+            "last_error": Value::Null,
+            "max_sequence_length": self.info_extras.max_sequence_length,
+            "profiles": Value::Object(profiles),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -254,10 +376,48 @@ profiles: {}
             adapter_module: Some("mod".into()),
             default_bundle: None,
             profiles: HashMap::new(),
+            inputs: None,
+            max_sequence_length: None,
+            tasks: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let back: ModelConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.name, "test/model");
         assert_eq!(back.adapter_module, Some("mod".into()));
+    }
+
+    #[test]
+    fn test_model_info_extras_defaults_dense_when_tasks_absent() {
+        let raw: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+name: example/model
+inputs:
+  text: true
+"#,
+        )
+        .unwrap();
+
+        let extras = ModelInfoExtras::from_yaml_raw(&raw);
+        assert_eq!(extras.outputs, vec!["dense"]);
+    }
+
+    #[test]
+    fn test_model_info_extras_does_not_invent_dense_for_non_encode_tasks() {
+        let raw: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+name: example/reranker
+inputs:
+  text: true
+tasks:
+  score:
+    relevance:
+      dim: 1
+"#,
+        )
+        .unwrap();
+
+        let extras = ModelInfoExtras::from_yaml_raw(&raw);
+        assert!(extras.outputs.is_empty());
+        assert!(extras.dims.is_empty());
     }
 }

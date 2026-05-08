@@ -8,6 +8,8 @@ use std::task::{Context, Poll};
 use subtle::ConstantTimeEq;
 use tower::{Layer, Service};
 
+use crate::http_error::code as err_code;
+
 use crate::config::Config;
 
 /// Paths that are always exempt from auth. Kubernetes liveness/readiness
@@ -16,6 +18,10 @@ use crate::config::Config;
 /// with worker URLs, bundle assignments, queue depth, GPU inventory) is
 /// intentionally NOT in this list — see `EXEMPT_OPERATIONAL_PATHS`.
 const EXEMPT_PROBE_PATHS: &[&str] = &["/healthz", "/readyz"];
+
+/// Public API description. Keep client-codegen and discovery usable even
+/// when request auth is enabled.
+const EXEMPT_DOC_PATHS: &[&str] = &["/openapi.json"];
 
 /// Paths that expose operational data (status page, rich `/health`,
 /// `/metrics`, `/ws/*`). Exempt from auth only when
@@ -74,7 +80,7 @@ where
 
             let path = req.uri().path();
 
-            if EXEMPT_PROBE_PATHS.contains(&path) {
+            if EXEMPT_PROBE_PATHS.contains(&path) || EXEMPT_DOC_PATHS.contains(&path) {
                 return inner.call(req).await;
             }
 
@@ -87,6 +93,7 @@ where
             if config.auth_tokens.is_empty() {
                 return Ok(error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
+                    err_code::GATEWAY_AUTH_MISCONFIGURED,
                     "Gateway auth enabled but no tokens configured",
                 ));
             }
@@ -96,6 +103,7 @@ where
                 None => {
                     return Ok(error_response(
                         StatusCode::UNAUTHORIZED,
+                        err_code::UNAUTHORIZED,
                         "Missing Authorization header",
                     ));
                 }
@@ -107,6 +115,7 @@ where
                 if config.admin_token.is_empty() {
                     return Ok(error_response(
                         StatusCode::FORBIDDEN,
+                        err_code::FORBIDDEN,
                         "Admin token not configured",
                     ));
                 }
@@ -114,6 +123,7 @@ where
                 if !constant_time_eq_str(&token, &config.admin_token) {
                     return Ok(error_response(
                         StatusCode::FORBIDDEN,
+                        err_code::FORBIDDEN,
                         "Admin token required",
                     ));
                 }
@@ -127,7 +137,11 @@ where
                 .any(|valid_token| constant_time_eq_str(&token, valid_token));
 
             if !valid {
-                return Ok(error_response(StatusCode::UNAUTHORIZED, "Invalid token"));
+                return Ok(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    err_code::UNAUTHORIZED,
+                    "Invalid token",
+                ));
             }
 
             inner.call(req).await
@@ -186,8 +200,13 @@ fn constant_time_eq_str(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response {
-    let body = serde_json::json!({"message": message});
+fn error_response(status: StatusCode, code: &'static str, message: &str) -> Response {
+    let body = serde_json::json!({
+        "detail": {
+            "code": code,
+            "message": message,
+        }
+    });
     (status, axum::Json(body)).into_response()
 }
 
@@ -267,6 +286,7 @@ mod tests {
         // Probe paths are always exempt; operational paths are not.
         assert!(EXEMPT_PROBE_PATHS.contains(&"/healthz"));
         assert!(EXEMPT_PROBE_PATHS.contains(&"/readyz"));
+        assert!(EXEMPT_DOC_PATHS.contains(&"/openapi.json"));
         assert!(!EXEMPT_PROBE_PATHS.contains(&"/health"));
         assert!(!EXEMPT_PROBE_PATHS.contains(&"/metrics"));
         assert!(EXEMPT_OPERATIONAL_PATHS.contains(&"/"));
@@ -339,6 +359,7 @@ mod tests {
             .route("/", get(|| async { "index" }))
             .route("/health", get(|| async { "rich-health" }))
             .route("/metrics", get(|| async { "metrics" }))
+            .route("/openapi.json", get(|| async { "{}" }))
             .route("/ws/cluster-status", get(|| async { "ws" }))
             .route("/v1/encode/{*model}", post(|| async { "encoded" }))
             .route("/v1/pools", post(|| async { "created" }))
@@ -374,6 +395,16 @@ mod tests {
         assert_eq!(send(r, Method::GET, "/healthz", None).await, StatusCode::OK);
         let r = test_router(cfg);
         assert_eq!(send(r, Method::GET, "/readyz", None).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn middleware_openapi_is_always_exempt() {
+        let cfg = cfg_for_middleware("token", vec!["user"], "admin", false);
+        let r = test_router(cfg);
+        assert_eq!(
+            send(r, Method::GET, "/openapi.json", None).await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]

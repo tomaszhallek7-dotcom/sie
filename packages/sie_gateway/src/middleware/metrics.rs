@@ -7,8 +7,8 @@
 //! `handlers::proxy::queue_mode_proxy` has been removed in favour of
 //! this layer.
 //!
-//! Only the three inference endpoints (`/v1/encode/*`, `/v1/score/*`,
-//! `/v1/extract/*`) populate `sie_gateway_requests_total` +
+//! Only inference endpoints (`/v1/encode/*`, `/v1/score/*`,
+//! `/v1/extract/*`, `/v1/embeddings`) populate `sie_gateway_requests_total` +
 //! `sie_gateway_request_latency_seconds`. Infrastructure paths
 //! (`/health*`, `/metrics`, `/ws/*`, `/v1/configs/*`, `/v1/pools`,
 //! `/v1/models`) are intentionally skipped: they are not traffic, and
@@ -42,7 +42,7 @@
 //! `/metrics` scrapes, config plane calls) pay **zero heap allocations
 //! and no clock reads** from this layer — the classifier runs on a
 //! borrowed `&str` and exits early when the path isn't one of the
-//! three inference prefixes.
+//! inference prefixes.
 //!
 //! For inference requests the added overhead is bounded:
 //! - One `Instant::now()` / `elapsed()` pair (vDSO, ~20 ns).
@@ -164,7 +164,7 @@ where
     }
 }
 
-/// Return the endpoint label (`encode`, `score`, `extract`) when the
+/// Return the endpoint label (`encode`, `score`, `extract`, `embeddings`) when the
 /// path matches an inference route, otherwise `None`. Non-inference
 /// paths are intentionally excluded — see module-level docs.
 ///
@@ -178,6 +178,8 @@ fn classify_endpoint(path: &str) -> Option<&'static str> {
         Some("score")
     } else if path.starts_with("/v1/extract/") {
         Some("extract")
+    } else if path == "/v1/embeddings" {
+        Some("embeddings")
     } else {
         None
     }
@@ -286,6 +288,10 @@ mod tests {
                     ))
                 }),
             )
+            .route(
+                "/v1/embeddings",
+                post(|req: Request<Body>| async move { set_profile(req, "l4-spot").await }),
+            )
             .route("/health", axum::routing::get(|| async { "health" }))
             .route("/metrics", axum::routing::get(|| async { "metrics" }))
             .layer(MetricsLayer::new())
@@ -393,6 +399,19 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // see COUNTER_TEST_LOCK doc
+    async fn records_200_on_openai_embeddings_from_handler_slot() {
+        let _guard = COUNTER_TEST_LOCK.lock().unwrap();
+        let _ = &*metrics::REGISTRY;
+        let before = counter_value("embeddings", "200", "l4-spot");
+
+        let status = fire(test_router(), Method::POST, "/v1/embeddings", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(counter_value("embeddings", "200", "l4-spot") - before, 1.0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see COUNTER_TEST_LOCK doc
     async fn skips_infrastructure_paths() {
         let _guard = COUNTER_TEST_LOCK.lock().unwrap();
         let _ = &*metrics::REGISTRY;
@@ -435,6 +454,7 @@ mod tests {
         assert_eq!(classify_endpoint("/v1/encode/org/model"), Some("encode"));
         assert_eq!(classify_endpoint("/v1/score/org/model"), Some("score"));
         assert_eq!(classify_endpoint("/v1/extract/org/model"), Some("extract"));
+        assert_eq!(classify_endpoint("/v1/embeddings"), Some("embeddings"));
         assert_eq!(classify_endpoint("/health"), None);
         assert_eq!(classify_endpoint("/healthz"), None);
         assert_eq!(classify_endpoint("/readyz"), None);

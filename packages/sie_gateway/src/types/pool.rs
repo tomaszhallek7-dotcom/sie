@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use utoipa::ToSchema;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PoolState {
     Pending,
@@ -19,7 +20,7 @@ impl std::fmt::Display for PoolState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PoolSpec {
     pub name: String,
     #[serde(default)]
@@ -32,14 +33,14 @@ pub struct PoolSpec {
     pub minimum_worker_count: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AssignedWorker {
     pub name: String,
     pub url: String,
     pub gpu: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PoolStatus {
     pub state: PoolState,
     #[serde(default)]
@@ -61,7 +62,7 @@ impl Default for PoolStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Pool {
     pub spec: PoolSpec,
     pub status: PoolStatus,

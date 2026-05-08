@@ -237,6 +237,51 @@ class TestPaddleOCRVLAdapter:
         finally:
             masking_utils.create_causal_mask = original
 
+    def test_extract_single_passes_use_cache_true(self) -> None:
+        """``_extract_single`` must pass ``use_cache=True`` to ``model.generate``.
+
+        Upstream's generation_config.json ships ``use_cache=false``; without an
+        explicit override KV-cache stays off and decode degrades to O(N^2).
+        """
+        import io
+
+        import torch
+        from PIL import Image as PILImage
+        from sie_server.adapters.paddleocr_vl import PaddleOCRVLAdapter
+
+        adapter = PaddleOCRVLAdapter("PaddlePaddle/PaddleOCR-VL-1.5")
+        adapter._device = "cpu"
+
+        mock_model = MagicMock()
+        mock_model.dtype = torch.float32
+        mock_model.generate.return_value = torch.zeros((1, 4), dtype=torch.long)
+        adapter._model = mock_model
+
+        mock_processor = MagicMock()
+        mock_processor.apply_chat_template.return_value = ""
+        mock_processor.decode.return_value = ""
+        mock_processor.return_value = {
+            "input_ids": torch.zeros((1, 1), dtype=torch.long),
+            "attention_mask": torch.zeros((1, 1), dtype=torch.long),
+            "pixel_values": torch.zeros((1, 1), dtype=torch.long),
+            "image_grid_thw": torch.zeros((1, 1), dtype=torch.long),
+        }
+        adapter._processor = mock_processor
+
+        buf = io.BytesIO()
+        PILImage.new("RGB", (4, 4)).save(buf, format="JPEG")
+        item = Item(images=[ImageInput(data=buf.getvalue(), format="jpeg")])
+
+        adapter._extract_single(
+            item,
+            task="ocr",
+            instruction=None,
+            max_new_tokens=8,
+            num_beams=1,
+        )
+
+        assert mock_model.generate.call_args.kwargs["use_cache"] is True
+
     def test_yaml_config_loads(self) -> None:
         """The shipped model YAML parses and resolves an adapter path."""
         import yaml

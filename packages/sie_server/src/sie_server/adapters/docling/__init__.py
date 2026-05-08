@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from sie_server.adapters._base_adapter import BaseAdapter
@@ -52,11 +51,17 @@ class DoclingAdapter(BaseAdapter):
     OCR is disabled by default for speed and predictability. Pass
     ``options={"ocr": True}`` per request to enable it.
 
-    Concurrency: a fresh ``DocumentConverter`` is built per item rather than
-    sharing one across threads. Construction is ~10 ms once Docling's
-    layout/table models have been pre-warmed (they cache globally), and this
-    sidesteps thread-safety concerns reported upstream
-    (https://github.com/docling-project/docling/issues/115).
+    Concurrency: one ``DocumentConverter`` is cached per ``ocr_enabled`` value
+    on the adapter instance. ``self._device`` is set once in ``load()`` and is
+    stable for the adapter's lifetime, so the effective cache key is
+    ``(self._device, ocr_enabled)`` and at most two converters ever exist per
+    adapter instance. Cross-request serialization is provided by
+    ``ModelWorker._inference_executor`` (max_workers=1), so the cache itself
+    does not need a lock. Items within one batch are processed serially
+    (rather than via a per-item thread pool) to sidestep the converter's known
+    thread-safety issue (https://github.com/docling-project/docling/issues/115);
+    at GPU-bound concurrency the upstream worker is already saturating the
+    device, so intra-batch parallelism does not buy real throughput.
     """
 
     spec: ClassVar[AdapterSpec] = AdapterSpec(
@@ -69,12 +74,13 @@ class DoclingAdapter(BaseAdapter):
         self,
         model_name_or_path: str | None = None,  # unused; Docling is package-backed
         *,
-        compute_precision: str | None = None,  # unused; Docling runs on CPU
+        compute_precision: str | None = None,  # unused; device is threaded via load()
         **kwargs: Any,
     ) -> None:
         _ = (model_name_or_path, compute_precision, kwargs)
         self._loaded = False
         self._device: str | None = None
+        self._converters: dict[bool, Any] = {}
 
     def load(self, device: str) -> None:
         self._device = device
@@ -82,11 +88,19 @@ class DoclingAdapter(BaseAdapter):
         # the first real request doesn't block on a multi-hundred-MB pull.
         # Models cache globally, so subsequent per-task converters are cheap.
         try:
-            warm_converter = self._make_converter(ocr_enabled=False)
+            warm_converter = self._get_converter(ocr_enabled=False)
             self._convert_bytes(warm_converter, _TINY_PDF_BYTES, format_hint="pdf")
+            # Also build the OCR-enabled converter so the first ocr-profile
+            # request doesn't pay layout+OCR model-init latency.
+            self._get_converter(ocr_enabled=True)
         except Exception:
             logger.exception("Docling pre-warm failed; first real request may be slow")
         self._loaded = True
+
+    def unload(self) -> None:
+        self._converters.clear()
+        self._loaded = False
+        super().unload()
 
     def extract(
         self,
@@ -113,27 +127,34 @@ class DoclingAdapter(BaseAdapter):
         )
 
     def _run_extract(self, items: list[Item], *, ocr_enabled: bool) -> list[dict[str, Any]]:
-        """Run extract per-item, parallelized across the batch.
+        """Run extract per-item, serially.
 
-        Each task gets its own DocumentConverter (see class docstring).
+        Items are processed one at a time so we can share a single cached
+        DocumentConverter (see class docstring). At GPU-bound concurrency the
+        worker-level inference executor is already saturating the device, so
+        intra-batch parallelism does not buy real throughput.
         """
-        if len(items) <= 1:
-            return [self._extract_one(item, ocr_enabled=ocr_enabled) for item in items]
-
-        with ThreadPoolExecutor(max_workers=min(len(items), 4)) as pool:
-            futures = [pool.submit(self._extract_one, item, ocr_enabled=ocr_enabled) for item in items]
-            return [f.result() for f in futures]
+        return [self._extract_one(item, ocr_enabled=ocr_enabled) for item in items]
 
     def _extract_one(self, item: Item, *, ocr_enabled: bool) -> dict[str, Any]:
         document = item.document
         if not is_document_input(document):
             return {"error": _ERR_REQUIRES_DOCUMENT}
         try:
-            converter = self._make_converter(ocr_enabled=ocr_enabled)
+            converter = self._get_converter(ocr_enabled=ocr_enabled)
             return self._convert_bytes(converter, document["data"], format_hint=document.get("format"))
         except Exception as e:  # noqa: BLE001 - per-item failure must not poison the batch
             logger.warning("Docling extract failed for item id=%s: %s", item.id, e)
             return {"error": str(e)}
+
+    def _get_converter(self, *, ocr_enabled: bool) -> Any:
+        """Return the cached DocumentConverter for this ocr_enabled value, building lazily on first use."""
+        cached = self._converters.get(ocr_enabled)
+        if cached is not None:
+            return cached
+        converter = self._make_converter(ocr_enabled=ocr_enabled)
+        self._converters[ocr_enabled] = converter
+        return converter
 
     def _convert_bytes(self, converter: Any, data: bytes, *, format_hint: str | None) -> dict[str, Any]:
         from docling.datamodel.base_models import DocumentStream  # ty: ignore[unresolved-import]
@@ -151,15 +172,45 @@ class DoclingAdapter(BaseAdapter):
         }
 
     def _make_converter(self, *, ocr_enabled: bool) -> Any:
-        """Build a fresh DocumentConverter. One per task — see class docstring."""
+        """Build a fresh DocumentConverter. Callers should usually go through _get_converter() for caching.
+
+        Threads self._device through Docling's AcceleratorOptions so layout, table,
+        and OCR models actually run on the configured device. Without this, Docling
+        silently defaults to CPU regardless of how SIE was launched.
+        """
         from docling.document_converter import DocumentConverter  # ty: ignore[unresolved-import]
 
-        if not ocr_enabled:
-            return DocumentConverter()
+        accelerator_options = self._build_accelerator_options()
 
         from docling.datamodel.base_models import InputFormat  # ty: ignore[unresolved-import]
         from docling.datamodel.pipeline_options import PdfPipelineOptions  # ty: ignore[unresolved-import]
         from docling.document_converter import PdfFormatOption  # ty: ignore[unresolved-import]
 
-        pdf_opts = PdfPipelineOptions(do_ocr=True)
+        # Pass do_ocr explicitly on both paths. Docling's PdfPipelineOptions defaults
+        # do_ocr=True, so an unset default would silently OCR every PDF and make the
+        # `ocr` profile a no-op vs. the default profile.
+        pdf_kwargs: dict[str, Any] = {"do_ocr": ocr_enabled}
+        if accelerator_options is not None:
+            pdf_kwargs["accelerator_options"] = accelerator_options
+        pdf_opts = PdfPipelineOptions(**pdf_kwargs)
         return DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)})
+
+    def _build_accelerator_options(self) -> Any:
+        """Translate self._device into a Docling AcceleratorOptions, or None."""
+        if not self._device:
+            return None
+        from docling.datamodel.accelerator_options import AcceleratorOptions  # ty: ignore[unresolved-import]
+
+        try:
+            return AcceleratorOptions(device=str(self._device))
+        except Exception as e:  # noqa: BLE001 - pydantic validation; fall back to auto
+            logger.warning(
+                "Docling: invalid device %r, falling back to 'auto' (%s)",
+                self._device,
+                e,
+            )
+            try:
+                return AcceleratorOptions(device="auto")
+            except Exception:
+                logger.exception("Docling: failed to build AcceleratorOptions even with 'auto'")
+                return None

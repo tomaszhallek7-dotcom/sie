@@ -1,6 +1,8 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
+use crate::http_error::{code as err_code, json_detail};
+
 #[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -19,14 +21,30 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, message) = match &self {
-            AppError::NoWorkerAvailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
-            AppError::GpuProvisioning(_) => (StatusCode::ACCEPTED, self.to_string()),
-            AppError::UpstreamConnection(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
-            AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+        let (status, code, message) = match &self {
+            AppError::NoWorkerAvailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                err_code::QUEUE_UNAVAILABLE,
+                self.to_string(),
+            ),
+            AppError::GpuProvisioning(_) => (
+                StatusCode::ACCEPTED,
+                err_code::PROVISIONING,
+                self.to_string(),
+            ),
+            AppError::UpstreamConnection(_) => (
+                StatusCode::BAD_GATEWAY,
+                err_code::INTERNAL_ERROR,
+                self.to_string(),
+            ),
+            AppError::Internal(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err_code::INTERNAL_ERROR,
+                self.to_string(),
+            ),
         };
 
-        let body = serde_json::json!({ "message": message });
+        let body = json_detail(code, message);
         (status, axum::Json(body)).into_response()
     }
 }

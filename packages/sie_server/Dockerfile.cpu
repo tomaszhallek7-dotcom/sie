@@ -39,7 +39,10 @@ COPY packages/sie_sdk/pyproject.toml /tmp/sie_sdk/pyproject.toml
 COPY packages/sie_server/pyproject.toml ./pyproject.toml
 
 # Stub source trees so pip accepts the editable installs during dep resolution.
-RUN mkdir -p /tmp/sie_sdk/src/sie_sdk src/sie_server \
+# Also create empty bundles/ and models/ — referenced by force-include in
+# pyproject.toml; hatchling resolves them at editable-metadata time even though
+# real contents only land in the `base` stage.
+RUN mkdir -p /tmp/sie_sdk/src/sie_sdk src/sie_server bundles models \
     && touch /tmp/sie_sdk/src/sie_sdk/__init__.py \
     && touch src/sie_server/__init__.py
 

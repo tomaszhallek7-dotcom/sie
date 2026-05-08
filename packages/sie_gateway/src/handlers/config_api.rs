@@ -25,8 +25,10 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Map};
+use utoipa::ToSchema;
 
+use crate::http_error::{code as err_code, json_detail, json_detail_merge};
 use crate::server::AppState;
 use crate::state::model_registry::ResolveError;
 
@@ -44,9 +46,12 @@ fn yaml_response<T: Serialize>(status: StatusCode, value: &T) -> Response {
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": format!("Failed to serialize YAML: {}", e)})),
+                Json(json_detail(
+                    err_code::SERIALIZATION_ERROR,
+                    format!("Failed to serialize YAML: {}", e),
+                )),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -58,6 +63,12 @@ fn yaml_response<T: Serialize>(status: StatusCode, value: &T) -> Response {
 }
 
 /// GET /v1/configs/models - List all model configs visible to this gateway.
+#[utoipa::path(
+    get,
+    path = "/v1/configs/models",
+    tag = "config",
+    responses((status = 200, description = "Model configs visible to this gateway replica", body = crate::openapi::ConfigModelsResponse))
+)]
 pub async fn get_model_configs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let models: Vec<serde_json::Value> = state
         .model_registry
@@ -99,6 +110,17 @@ pub async fn get_model_configs(State(state): State<Arc<AppState>>) -> impl IntoR
 /// register model IDs ending in `/status` so the pathological case where
 /// **both** `foo` and `foo/status` are models cannot arise, but we
 /// still degrade gracefully if it ever does.
+#[utoipa::path(
+    get,
+    path = "/v1/configs/models/{id}",
+    tag = "config",
+    params(("id" = String, Path, description = "Model id; percent-encode slashes when using OpenAPI-generated clients")),
+    responses(
+        (status = 200, description = "Model config YAML", body = crate::openapi::ConfigModelDocument, content_type = "application/x-yaml"),
+        (status = 404, description = "Model not found", body = crate::openapi::StandardApiError),
+        (status = 500, description = "Failed to serialize YAML", body = crate::openapi::StandardApiError)
+    )
+)]
 pub async fn get_model_config_or_status(
     State(state): State<Arc<AppState>>,
     Path(raw): Path<String>,
@@ -117,7 +139,10 @@ fn model_config_response(state: &AppState, id: &str) -> Response {
     let Some(model_info) = state.model_registry.get_model_info(id) else {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({"message": format!("Model '{}' not found", id)})),
+            Json(json_detail(
+                err_code::MODEL_NOT_FOUND,
+                format!("Model '{}' not found", id),
+            )),
         )
             .into_response();
     };
@@ -147,7 +172,10 @@ async fn model_status_response(state: &AppState, id: &str) -> Response {
     let Some(model_info) = state.model_registry.get_model_info(id) else {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({"message": format!("Model '{}' not found", id)})),
+            Json(json_detail(
+                err_code::MODEL_NOT_FOUND,
+                format!("Model '{}' not found", id),
+            )),
         )
             .into_response();
     };
@@ -225,6 +253,12 @@ async fn compute_model_status(
 }
 
 /// GET /v1/configs/bundles - List all bundle configs.
+#[utoipa::path(
+    get,
+    path = "/v1/configs/bundles",
+    tag = "config",
+    responses((status = 200, description = "Bundle configs visible to this gateway replica", body = crate::openapi::BundleConfigsResponse))
+)]
 pub async fn get_bundle_configs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let workers = state.registry.workers().await;
 
@@ -253,6 +287,17 @@ pub async fn get_bundle_configs(State(state): State<Arc<AppState>>) -> impl Into
 }
 
 /// GET /v1/configs/bundles/{id} - Get specific bundle config.
+#[utoipa::path(
+    get,
+    path = "/v1/configs/bundles/{id}",
+    tag = "config",
+    params(("id" = String, Path, description = "Bundle id")),
+    responses(
+        (status = 200, description = "Bundle config YAML", body = crate::openapi::BundleConfigDocument, content_type = "application/x-yaml"),
+        (status = 404, description = "Bundle not found", body = crate::openapi::StandardApiError),
+        (status = 500, description = "Failed to serialize YAML", body = crate::openapi::StandardApiError)
+    )
+)]
 pub async fn get_bundle_config(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -260,7 +305,10 @@ pub async fn get_bundle_config(
     let Some(info) = state.model_registry.get_bundle_info(&id) else {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({"message": format!("Bundle '{}' not found", id)})),
+            Json(json_detail(
+                err_code::BUNDLE_NOT_FOUND,
+                format!("Bundle '{}' not found", id),
+            )),
         )
             .into_response();
     };
@@ -275,13 +323,24 @@ pub async fn get_bundle_config(
 }
 
 /// POST /v1/configs/resolve - Resolve bundle for a model.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ResolveRequest {
     pub model: String,
     #[serde(default)]
     pub bundle: Option<String>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/configs/resolve",
+    tag = "config",
+    request_body = ResolveRequest,
+    responses(
+        (status = 200, description = "Resolved runtime bundle", body = crate::openapi::ResolveConfigResponse),
+        (status = 404, description = "Model not found", body = crate::openapi::ResolveModelNotFoundResponse),
+        (status = 409, description = "Bundle override conflict", body = crate::openapi::ResolveBundleConflictResponse)
+    )
+)]
 pub async fn resolve_config(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ResolveRequest>,
@@ -312,21 +371,37 @@ pub async fn resolve_config(
             )
                 .into_response()
         }
-        Err(ResolveError::ModelNotFound(e)) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"message": e.to_string(), "model": model_name})),
-        )
-            .into_response(),
-        Err(ResolveError::BundleConflict(e)) => (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "message": e.to_string(),
-                "model": model_name,
-                "bundle": e.bundle,
-                "compatible_bundles": e.compatible_bundles,
-            })),
-        )
-            .into_response(),
+        Err(ResolveError::ModelNotFound(e)) => {
+            let mut m = Map::new();
+            m.insert("model".to_string(), json!(model_name));
+            (
+                StatusCode::NOT_FOUND,
+                Json(json_detail_merge(
+                    err_code::MODEL_NOT_FOUND,
+                    e.to_string(),
+                    m,
+                )),
+            )
+                .into_response()
+        }
+        Err(ResolveError::BundleConflict(e)) => {
+            let mut m = Map::new();
+            m.insert("model".to_string(), json!(model_name));
+            m.insert("bundle".to_string(), json!(e.bundle));
+            m.insert(
+                "compatible_bundles".to_string(),
+                json!(e.compatible_bundles),
+            );
+            (
+                StatusCode::CONFLICT,
+                Json(json_detail_merge(
+                    err_code::CONFIG_RESOLVE_BUNDLE_CONFLICT,
+                    e.to_string(),
+                    m,
+                )),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -657,6 +732,9 @@ mod tests {
                 adapter_module: None,
                 default_bundle: None,
                 profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: None,
             })
             .unwrap();
     }
@@ -846,6 +924,9 @@ mod tests {
             adapter_module: None,
             default_bundle: None,
             profiles,
+            inputs: None,
+            max_sequence_length: None,
+            tasks: None,
         });
         // The add above will error because 'nonexistent.module' isn't in
         // any bundle — which is actually the intended real-world path:
@@ -864,6 +945,7 @@ mod tests {
             adapter_modules: Default::default(),
             profile_names: Default::default(),
             profile_configs: Default::default(),
+            info_extras: Default::default(),
         };
         let status = compute_model_status(state.as_ref(), &entry).await;
         assert_eq!(status["all_bundles_acked"], false);

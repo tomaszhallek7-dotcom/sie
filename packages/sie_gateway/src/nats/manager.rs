@@ -605,6 +605,9 @@ adapters:
                 );
                 profiles
             },
+            inputs: None,
+            max_sequence_length: None,
+            tasks: None,
         };
         registry.add_model_config(seed).unwrap();
 

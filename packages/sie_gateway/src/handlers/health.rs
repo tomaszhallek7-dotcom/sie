@@ -1,5 +1,6 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::http::header;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::Json;
@@ -10,6 +11,12 @@ use std::time::Duration;
 use crate::server::AppState;
 
 /// Static HTML status page
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "health",
+    responses((status = 200, description = "HTML gateway status page", body = String, content_type = "text/html"))
+)]
 pub async fn status_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cluster = state.registry.get_cluster_status().await;
     let status_str = if cluster.worker_count > 0 {
@@ -68,21 +75,48 @@ pub async fn status_page(State(state): State<Arc<AppState>>) -> impl IntoRespons
     Html(html)
 }
 
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "health",
+    responses((
+        status = 200,
+        description = "Liveness probe (plain text, matches sie_server)",
+        body = String,
+        content_type = "text/plain; charset=utf-8"
+    ))
+)]
 pub async fn healthz() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({"status": "ok"})))
-}
-
-pub async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let healthy = state.registry.healthy_workers().await.len();
     (
         StatusCode::OK,
-        Json(json!({
-            "status": "ready",
-            "healthy_workers": healthy,
-        })),
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        "ok",
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    tag = "health",
+    description = "Process readiness only. Always returns 200 once the gateway is serving requests; never returns 503. Worker readiness is reported by GET /health and by inference responses (202 + Retry-After from a workerless gateway). This contract supports KEDA scale-from-zero.",
+    responses(
+        (status = 200, description = "Gateway process is ready", body = String, content_type = "text/plain; charset=utf-8")
+    )
+)]
+pub async fn readyz() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        "ok",
+    )
+}
+
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "health",
+    responses((status = 200, description = "Gateway cluster health", body = crate::openapi::HealthResponse))
+)]
 pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cluster = state.registry.get_cluster_status().await;
     let status_str = if cluster.worker_count > 0 {
@@ -112,6 +146,12 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/ws/cluster-status",
+    tag = "observability",
+    responses((status = 101, description = "WebSocket cluster status stream"))
+)]
 pub async fn ws_cluster_status(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,

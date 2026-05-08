@@ -310,6 +310,11 @@ def sie_docker_server() -> Generator[str]:
         },
         "environment": {
             "HF_HOME": "/app/.cache/huggingface",
+            # Propagate the deployment-env tag from the host (set to "ci" by
+            # the GH workflow, "development" by `mise run serve`) into the
+            # container so heartbeats from the dockerised sie-server don't
+            # land in the "unknown" telemetry bucket.
+            "SIE_DEPLOYMENT_ENV": os.environ.get("SIE_DEPLOYMENT_ENV", "development"),
         },
     }
 

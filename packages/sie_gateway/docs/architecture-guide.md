@@ -44,6 +44,7 @@ Key terms used throughout this document:
    - `POST /v1/encode/{*model}`
    - `POST /v1/score/{*model}`
    - `POST /v1/extract/{*model}`
+   - `POST /v1/embeddings` — OpenAI-compatible JSON surface; the gateway accepts **string** or **list of strings** for `input`, supports `encoding_format=float` (default) or `base64`, translates to an internal **`POST /v1/encode/{model}`** with `items[].text` and `params.output_types=["dense"]`, then maps encode `items[].dense` vectors into OpenAI `data[].embedding` plus a rough `usage` estimate. Token-id / nested-array inputs are rejected with **`400`**.
 2. Gateway resolves the request to a model, a bundle, a machine profile, and a queue pool using its in-memory registry.
 3. Gateway publishes work to JetStream on `sie.work.{model}.{pool}`.
 4. A matching worker consumes the work item and executes inference.
@@ -60,8 +61,13 @@ Rules enforced on the inference path:
 - On no-consumer conditions for the JetStream publish the gateway returns `503` with `Retry-After: 120`. On backpressure conditions the gateway returns `503` with `Retry-After: 5`.
 - On queue result timeouts the gateway returns `503` with `X-SIE-Error-Code: MODEL_LOADING` and `Retry-After: 5`. The most common trigger is a worker cold-loading the target model on demand (worker NAKs the JetStream message and redelivers after load); the SDK retries this under the same `provision_timeout_s` budget used for worker-emitted `MODEL_LOADING` responses.
 - When workers report failure on every item of a batch with the **same retryable error code** in `WorkResult.error_code`, the gateway translates that into a `503` with the SDK-expected envelope (`error.code`, `Retry-After`, `X-SIE-Error-Code`) so the SDK auto-retries. Currently recognised codes: `RESOURCE_EXHAUSTED` (worker-side OOM recovery exhausted — `Retry-After: 5`), `MODEL_LOADING`, and `LORA_LOADING`. **Mixed batches** (different codes per item) keep going through the legacy `500 all_items_failed` path with per-item `code` fields exposed in `details[]`, so callers can see exactly which items hit which failure mode. Workers reporting `RESOURCE_EXHAUSTED` are **not** marked unhealthy — losing an allocation race is not a worker-health signal.
+- When **every** failed item carries **`MODEL_LOAD_FAILED`**, the gateway returns **`502 Bad Gateway`** with the SDK-style **`error`** object (`code`, `message`, `error_class`, `attempts`, `permanent`) — matching the terminal model-load contract consumed by SDK retry logic (no `Retry-After`; the SDK must not burn the `MODEL_LOADING` retry budget). The gateway synthesises conservative `attempts` / `permanent` fields on this queue path when the worker payload does not carry registry-shaped failure metadata.
+
+Encode / extract tuning fields (`output_types`, `instruction`, `options`, `labels`, `output_schema`, `is_query`) are read **only** from the nested JSON **`params`** object (and the msgpack analogue: a top-level **`params`** map). The score path continues to read `query` / `instruction` / `options` at the top level of the request body, matching `sie_server`.
 
 Work-item and result payloads on the wire are **msgpack** (`rmp_serde`). JSON is used only for the HTTP request/response envelope when the client negotiates it (via `Content-Type` / `Accept`); the gateway transcodes msgpack ↔ JSON at the edge so the hot path between gateway and workers is always binary.
+
+Gateway-generated **JSON error** bodies (validation, routing, auth, config read, pools) use a FastAPI-like envelope **`{"detail":{"code":"<STABLE_CODE>","message":"…", …}}`**. Extra diagnostic keys (e.g. `compatible_bundles`, `gpu`, `model`) live **inside** `detail` when present. This is intentionally **not** the same shape as SDK retry contracts, which remain **`{"error":{"code","message"}}`** for **503** retryable worker signals and **`502`** **`MODEL_LOAD_FAILED`**. **202 provisioning** and **200** success payloads keep their existing top-level shapes.
 
 ## 3. Configuration Write Path
 
@@ -113,9 +119,11 @@ The gateway does not block startup on `sie-config`. Startup is:
 1. Construct `ModelRegistry`. In default Helm deploys, `SIE_BUNDLES_DIR` and `SIE_MODELS_DIR` are unset and the registry's filesystem reload is a no-op (warns once that the dirs are missing, then proceeds with empty bundle and model maps). The optional `gateway.embeddedConfigs` / `gateway.configMap` overlays mount a ConfigMap at `/configs/{bundles,models}` and set those env vars; in that mode the registry loads the seed before bootstrap runs.
 2. Initialize the other runtime subsystems that do not depend on `sie-config`: NATS manager (with config-delta subscription), worker health manager, optional filesystem config watcher, pool manager / K8s backend, and worker discovery.
 3. Spawn two independent background tasks: `state::config_bootstrap::spawn_bootstrap_retry` and `state::config_poller::spawn`. They share the same `ModelRegistry`, `ConfigEpoch` (monotonic model-write counter), and `BundlesHash` (sha256 fingerprint of `sie-config`'s loaded bundle set). The poller skips its first tick (one `DEFAULT_POLL_INTERVAL` grace) so the initial bootstrap attempt can run first, and then reconciles on every subsequent tick regardless of whether the bootstrap task has completed yet.
-4. Bind the HTTP listener. `/readyz` returns `200` unconditionally — it does not gate on `sie-config` reachability.
+4. Bind the HTTP listener. Kubernetes probes use plain-text endpoints implemented in `handlers/health.rs`:
+   - **`GET /healthz`** — liveness. Always **`200 OK`** with body **`ok`** and **`Content-Type: text/plain; charset=utf-8`** (same wire shape as `sie_server`'s `/healthz`).
+   - **`GET /readyz`** — readiness for **routing traffic to this gateway process**. Returns **`200 OK`** + **`ok`** once the gateway listener is serving. It is intentionally independent of worker health and `sie-config` reachability: a gateway with zero healthy workers must still receive the first inference request so it can return `202 + Retry-After` and emit `sie_gateway_pending_demand` for scale-from-zero. Worker availability is exposed on **`GET /health`** and by the inference response path itself.
 
-The bootstrap/poller tasks are spawned **before** the HTTP listener binds, so requests hitting a freshly-bound replica can observe either filesystem-seed-only state or a partially-applied snapshot depending on timing. That is by design; `/readyz` does not gate on control-plane sync (see §11 caveat 3).
+The bootstrap/poller tasks are spawned **before** the HTTP listener binds, so requests hitting a freshly-bound replica can observe either filesystem-seed-only state or a partially-applied snapshot depending on timing. That is by design. **`/readyz` does not wait for control-plane sync** (see §11 caveat 3); bootstrap completeness is tracked via **`GET /v1/configs/models/{id}/status`**, **`sie_gateway_config_bootstrap_degraded`**, and **`sie_gateway_config_epoch`** — not by `/readyz` alone.
 
 ### 4.1 Bootstrap retry
 
@@ -148,7 +156,7 @@ On failure (DNS, 5xx, timeout, decode error, partial apply):
 
 During the bootstrap-retry window (before the first successful fetch):
 
-- `/readyz` returns `200` unconditionally. The gateway serves filesystem-seed traffic.
+- **`GET /readyz`** follows the **process-readiness** rule above — it is **not** tied to export success or worker health. The gateway still serves whatever models exist in the in-memory registry (typically filesystem-seed-only during this window), and workerless inference requests can still reach the gateway to trigger scale-from-zero.
 - `GET /v1/configs/models/{id}` returns only filesystem-seeded models.
 - `POST /v1/configs/resolve` for API-only models returns `404`. Admin tooling retries with backoff.
 - `ConfigEpoch.get()` typically returns `0` and `GET /v1/configs/models/{id}/status` surfaces `config_epoch: 0`, which admin tooling uses to detect a pre-bootstrap replica. The epoch is not strictly pinned to `0`, however: if the NATS delta subscriber (§4.3) receives a valid `ConfigNotification` with a non-zero `epoch` before the first export succeeds, `ConfigEpoch::set_max` will advance the counter. The `config_bootstrap_degraded` gauge is the more reliable "has export ever succeeded?" signal.
@@ -357,11 +365,11 @@ The gateway has no persistent config store. `SIE_CONFIG_STORE_DIR` and `SIE_CONF
 
 ## 11. Known Operational Caveats
 
-1. **`sie-config` is a single point of failure for the control plane.** While the pod is down, config writes, authoritative config reads, and gateway catch-up fetches all fail. **The inference hot path is unaffected** — it never touches `sie-config`. New gateway pods enter the soft-degraded bootstrap-retry state (§4.1) and serve filesystem-seed traffic until `sie-config` is reachable. The SPOF is rooted in `_IdempotencyState` (in-memory, per-process). Multi-replica requires moving idempotency state to a shared backend (Redis, JetStream KV, a DB row per key). Until then, `replicas: 1` is a deliberate trade of availability for a correct idempotency contract.
+1. **`sie-config` is a single point of failure for the control plane.** While the pod is down, config writes, authoritative config reads, and gateway catch-up fetches all fail. **The inference hot path is unaffected** — it never touches `sie-config`. New gateway pods enter the soft-degraded bootstrap-retry state (§4.1), serve filesystem-seed traffic until `sie-config` is reachable, and return **`200 ok`** from **`GET /readyz`** once the process is serving. The SPOF is rooted in `_IdempotencyState` (in-memory, per-process). Multi-replica requires moving idempotency state to a shared backend (Redis, JetStream KV, a DB row per key). Until then, `replicas: 1` is a deliberate trade of availability for a correct idempotency contract.
 
 2. **Config deltas use NATS Core pub/sub; deltas published during a gateway-NATS disconnect are lost.** Recovery is automatic via the epoch poller (§4.2). The worst-case staleness window is `DEFAULT_POLL_INTERVAL` plus one export round-trip. No pod restart is required. Shortening `DEFAULT_POLL_INTERVAL` trades load on `sie-config` for recovery time.
 
-3. **Bootstrap is background-retried, not blocking.** A gateway started while `sie-config` is unreachable will serve filesystem-seed traffic immediately. API-added models are missing until the first successful export. `ConfigEpoch` typically stays at `0` during this window — but a NATS delta that arrives before the first export can move it above `0`, so admin tooling should use the `sie_gateway_config_bootstrap_degraded` gauge (set after 10 failed attempts or 5 minutes of sustained failure, cleared on first success) as the authoritative "has this replica ever reconciled with `sie-config`?" signal rather than `config_epoch == 0`.
+3. **Bootstrap is background-retried, not blocking.** A gateway started while `sie-config` is unreachable will serve filesystem-seed traffic immediately. API-added models are missing until the first successful export. `ConfigEpoch` typically stays at `0` during this window — but a NATS delta that arrives before the first export can move it above `0`, so admin tooling should use the `sie_gateway_config_bootstrap_degraded` gauge (set after 10 failed attempts or 5 minutes of sustained failure, cleared on first success) as the authoritative "has this replica ever reconciled with `sie-config`?" signal rather than `config_epoch == 0`. **`GET /readyz` does not encode bootstrap completion or worker health**; it is process readiness (§4).
 
 4. **Partial NATS publish on `sie-config`.** If a write succeeds on disk and in the registry but the NATS publish fails for a subset of affected bundles, `sie-config` still returns `201` (or `200` for no-op replays) with a structured `warnings` entry naming the failed bundles. Workers on those bundles stay on the previous epoch until the gateway poller triggers a re-export.
 
@@ -380,7 +388,7 @@ The gateway has no persistent config store. `SIE_CONFIG_STORE_DIR` and `SIE_CONF
 
    The `gateway.embeddedConfigs` / `gateway.configMap` Helm overlays remain available as an escape hatch that statically seeds the registry and eliminates the cold-start dependency, at the cost of losing live bundle resync.
 
-8. **`registry_unavailable` (503) on `sie-config`.** If the `ModelRegistry` failed to initialize (e.g. malformed bundle YAML), `sie-config`'s `/readyz` returns 503 and every registry-dependent endpoint (`/v1/configs/models`, `/v1/configs/models/{id}`, `/v1/configs/bundles`, `/v1/configs/bundles/{id}`, `/v1/configs/resolve`, `POST /v1/configs/models`, `/v1/configs/export`) returns 503 with a structured `registry_unavailable` error body. `/epoch` is intentionally independent of the registry (it reads the epoch file directly), so the gateway's poller can still discover that `sie-config` is up but not serving — admin tooling should treat `/readyz=503` plus `/epoch=200` as "control plane is alive but wedged; inspect logs".
+8. **`registry_unavailable` (503) on `sie-config`.** (This is **`sie-config`'s** `/readyz`, not the gateway's — same path string, different process.) If the `ModelRegistry` failed to initialize (e.g. malformed bundle YAML), `sie-config`'s `/readyz` returns 503 and every registry-dependent endpoint (`/v1/configs/models`, `/v1/configs/models/{id}`, `/v1/configs/bundles`, `/v1/configs/bundles/{id}`, `/v1/configs/resolve`, `POST /v1/configs/models`, `/v1/configs/export`) returns 503 with a structured `registry_unavailable` error body. `/epoch` is intentionally independent of the registry (it reads the epoch file directly), so the gateway's poller can still discover that `sie-config` is up but not serving — admin tooling should treat **`sie-config` `/readyz=503`** plus **`/epoch=200`** as "control plane is alive but wedged; inspect logs".
 
 ## 12. Interaction Rules (Invariants)
 
@@ -403,7 +411,7 @@ Gateway (`sie-gateway`):
 - `SIE_ADMIN_TOKEN` — (1) bearer token the gateway-as-client presents on `GET /v1/configs/export` and `GET /v1/configs/epoch`; (2) the token that `AuthLayer` requires for admin-gated mutations on the gateway itself (`POST/PUT/DELETE` on `/v1/configs/*`, `/v1/admin/*`, `/v1/pools/*`). If empty and the matching inbound request targets an admin path, the middleware fails closed with `403`. On outbound calls, if empty, no `Authorization` header is sent (so `sie-config` must either be unauthenticated or the gateway will fail with `401`/`403`).
 - `SIE_AUTH_TOKEN` / `SIE_AUTH_TOKENS` — tokens accepted by the gateway's own inference API (`/v1/encode`, `/v1/score`, `/v1/extract`) and for read-side pool/config routes. Not used for outbound calls to `sie-config`. When `SIE_AUTH_MODE` enables auth but this list is empty, every non-probe request returns `500`.
 - `SIE_AUTH_MODE` — `token` (alias: `static`) enforces auth; `none` (default) disables it. Typos are fail-open-to-bypass by design; `audit_auth` logs a startup error naming the bad value so operators see it in `kubectl logs`.
-- `SIE_AUTH_EXEMPT_OPERATIONAL` — when `true`, `/`, `/health`, `/metrics`, and `/ws/*` are exempt from auth (they expose worker URLs, bundle assignments, queue depth, GPU inventory — treat as sensitive). Default `false`. `/healthz` and `/readyz` are **always** exempt because Kubernetes probes carry no credentials; a misconfiguration must not take the pod out of rotation.
+- `SIE_AUTH_EXEMPT_OPERATIONAL` — when `true`, `/`, `/health`, `/metrics`, and `/ws/*` are exempt from auth (they expose worker URLs, bundle assignments, queue depth, GPU inventory — treat as sensitive). Default `false`. **`/healthz` and `/readyz` are always exempt from auth** so kubelet probes never fail with **`401`/`403`** because of a missing bearer token. `/readyz` reports process readiness only; worker health remains visible through `/health` and inference responses.
 - `SIE_NATS_CONFIG_TRUSTED_PRODUCERS` — comma-separated producer allowlist for `sie.config.models._all`. Default `sie-config`. Matching is exact OR K8s pod-name prefix (see §4.3). Untrusted notifications are dropped; the `config_poller` still closes the gap.
 - `SIE_NATS_CONFIG_TRUST_ANY_PRODUCER` — `true` disables producer validation entirely. Intended for local/dev. `main.rs` emits a startup audit warning when on.
 - NATS connection variables per the existing gateway configuration.
@@ -426,6 +434,7 @@ Inference (queue-only):
 - `POST /v1/encode/{*model}`
 - `POST /v1/score/{*model}`
 - `POST /v1/extract/{*model}`
+- `POST /v1/embeddings` — OpenAI JSON compatibility layer over encode (string or list of strings); see §2.
 
 Config (read-side only):
 
@@ -438,7 +447,7 @@ Config (read-side only):
 Pools and operator:
 
 - `GET /v1/pools`, `POST /v1/pools`, `GET /v1/pools/{name}`, `POST /v1/pools/{name}/renew`, `DELETE /v1/pools/{name}`
-- `GET /v1/models`
+- `GET /v1/models`, `GET /v1/models/{*model}` — model catalogue. JSON objects mirror `sie_server` **`ModelInfo`** shape (including `inputs`, `outputs`, `dims`, `profiles`, worker-derived `loaded` / `state`, optional `last_error`, …). An unknown `model` id returns **`404`** with **`{"detail":{"code":"MODEL_NOT_FOUND",...}}`** (same envelope style as FastAPI validation errors on `sie_server`).
 - `GET /healthz`, `GET /readyz`, `GET /health`
 - `GET /metrics`
 - `GET /ws/cluster-status`

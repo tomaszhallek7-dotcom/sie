@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -33,6 +34,27 @@ from sie_server.observability.telemetry import telemetry_sender
 from sie_server.observability.tracing import setup_tracing
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _timed_stage(name: str, cm: Any) -> AsyncGenerator[Any, None]:
+    """Wrap an async context manager to log its entry-phase elapsed time.
+
+    Emits one structured line per stage on entry — `lifespan.stage <name>
+    elapsed_s=<x>` — so cold-start tooling (issue #816) can attribute the ~5s
+    `engine_boot_s` consistently seen across LTFR runs to specific lifespan
+    stages (NVML init, NATS connect, telemetry handshake, etc).
+
+    The exit-phase teardown is intentionally not timed — only the setup phase
+    contributes to `engine_boot_s`. ``cm`` is typed as ``Any`` because the
+    contextlib ``@asynccontextmanager`` wrapper produces a context manager
+    type that ty struggles to bind through a TypeVar parameter.
+    """
+    t0 = time.perf_counter()
+    async with cm as value:
+        elapsed = time.perf_counter() - t0
+        logger.info("lifespan.stage %s elapsed_s=%.3f", name, elapsed)
+        yield value
 
 
 class AppFactory:
@@ -80,15 +102,16 @@ class AppFactory:
             - Then proceeds with normal shutdown (unload models, cleanup)
             """
             init_server_start_time()
+            cls._configure_torch_threads()
             cls._configure_cuda_defaults()
             async with (
-                cls._nvml(),
-                telemetry_sender(),
-                cls._model_registry(config) as registry,
-                cls._nats_subscriber(registry) as nats_sub,
-                cls._nats_pull_loop(registry, nats_sub) as pull_loop,
-                cls._graceful_shutdown(shutdown_state),
-                cls._readiness_handling(),
+                _timed_stage("nvml", cls._nvml()),
+                _timed_stage("telemetry", telemetry_sender()),
+                _timed_stage("model_registry", cls._model_registry(config)) as registry,
+                _timed_stage("nats_subscriber", cls._nats_subscriber(registry)) as nats_sub,
+                _timed_stage("nats_pull_loop", cls._nats_pull_loop(registry, nats_sub)) as pull_loop,
+                _timed_stage("graceful_shutdown", cls._graceful_shutdown(shutdown_state)),
+                _timed_stage("readiness", cls._readiness_handling()),
             ):
                 app.state.registry = registry
                 app.state.nats_subscriber = nats_sub
@@ -293,8 +316,10 @@ class AppFactory:
         in the async-with stack, so the pod stays NotReady during preload.
         """
         if not config.preload_models:
+            logger.info("lifespan.stage preload_models elapsed_s=0.000")
             return
 
+        t0 = time.perf_counter()
         logger.info("Preloading %d model(s): %s", len(config.preload_models), ", ".join(config.preload_models))
 
         # Sequential loading is intentional: parallel loads risk OOM on GPU workers
@@ -313,7 +338,9 @@ class AppFactory:
                     name,
                 )
 
+        elapsed = time.perf_counter() - t0
         logger.info("Preload complete: %d/%d models loaded", succeeded, len(config.preload_models))
+        logger.info("lifespan.stage preload_models elapsed_s=%.3f", elapsed)
 
     @staticmethod
     def _configure_cuda_defaults() -> None:
@@ -329,3 +356,34 @@ class AppFactory:
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
         logger.info("CUDA defaults: TF32 enabled, cudnn.benchmark enabled")
+
+    @staticmethod
+    def _configure_torch_threads() -> None:
+        # Cap torch BLAS threads so concurrent CPU consumers (Docling per-batch
+        # pool, image preprocessor pool) don't oversubscribe cores. Override
+        # via SIE_TORCH_NUM_THREADS; default = half the logical cores.
+        override = os.environ.get("SIE_TORCH_NUM_THREADS")
+        if override is not None:
+            try:
+                n = int(override)
+                if n < 1:
+                    raise ValueError
+            except ValueError:
+                logger.warning(
+                    "SIE_TORCH_NUM_THREADS=%r is not a positive integer; using default",
+                    override,
+                )
+                n = max(1, (os.cpu_count() or 4) // 2)
+                logger.info("torch threads: %d (default after invalid override; cpu_count=%s)", n, os.cpu_count())
+            else:
+                logger.info("torch threads: %d (from SIE_TORCH_NUM_THREADS)", n)
+        else:
+            n = max(1, (os.cpu_count() or 4) // 2)
+            logger.info("torch threads: %d (default; cpu_count=%s)", n, os.cpu_count())
+
+        torch.set_num_threads(n)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            # Already initialised; safe to ignore — only the first call has effect.
+            logger.warning("torch.set_num_interop_threads(1) ignored: parallel runtime already started")

@@ -140,23 +140,41 @@ export async function throwIfModelLoadFailed(response: Response, model?: string)
 export async function handleError(response: Response, gpu?: string): Promise<never> {
   const { status } = response;
 
-  let errorBody: { code?: string; detail?: string } = {};
-  try {
-    errorBody = (await response.json()) as { code?: string; detail?: string };
-  } catch {
-    // Ignore JSON parsing errors
+  // Prefer nested ``error`` / ``detail`` objects (gateway + FastAPI dict detail),
+  // same as Python ``handle_error``. Legacy: string ``detail``, or top-level
+  // ``message`` (e.g. gateway 202 provisioning body).
+  const detail = await getErrorDetail(response.clone());
+
+  let code: string | undefined;
+  let message: string;
+
+  if (detail) {
+    const c = detail.code;
+    code = typeof c === "string" ? c : undefined;
+    const m = detail.message;
+    message = typeof m === "string" ? m : JSON.stringify(detail);
+  } else {
+    try {
+      const data = (await response.json()) as Record<string, unknown>;
+      if (typeof data.detail === "string") {
+        code = typeof data.code === "string" ? data.code : undefined;
+        message = data.detail;
+      } else if (typeof data.message === "string") {
+        code = typeof data.code === "string" ? data.code : undefined;
+        message = data.message;
+      } else {
+        code = typeof data.code === "string" ? data.code : undefined;
+        message = response.statusText;
+      }
+    } catch {
+      code = undefined;
+      message = response.statusText;
+    }
   }
 
-  const code = errorBody.code ?? "UNKNOWN";
-  const message = errorBody.detail ?? response.statusText;
-
   if (status === HTTP_ACCEPTED) {
-    const retryAfter = response.headers.get("Retry-After");
-    throw new ProvisioningError(
-      message,
-      gpu,
-      retryAfter ? Number.parseInt(retryAfter, 10) * 1000 : undefined,
-    );
+    const retryAfter = getRetryAfter(response);
+    throw new ProvisioningError(message, gpu, retryAfter);
   }
 
   if (status >= HTTP_CLIENT_ERROR_MIN && status <= HTTP_CLIENT_ERROR_MAX) {

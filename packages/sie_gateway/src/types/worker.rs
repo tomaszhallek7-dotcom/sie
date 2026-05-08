@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
+use utoipa::ToSchema;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerHealth {
@@ -49,7 +50,7 @@ impl WorkerState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ClusterStatus {
     pub timestamp: f64,
     pub worker_count: i32,
@@ -60,7 +61,7 @@ pub struct ClusterStatus {
     pub models: Vec<ModelInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct WorkerInfo {
     pub name: String,
     pub url: String,
@@ -75,7 +76,7 @@ pub struct WorkerInfo {
     pub bundle_config_hash: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelInfo {
     pub name: String,
     pub state: String,

@@ -82,12 +82,16 @@ class SentenceTransformerDenseAdapter(BaseAdapter):
             trust_remote_code=self._trust_remote_code,
             config_kwargs=self._config_kwargs,
         )
-        _ = self._model.encode(["warmup"], convert_to_numpy=True, show_progress_bar=False)
 
         if self._max_seq_length is not None:
             self._model.max_seq_length = self._max_seq_length
 
         self._dense_dim = self._model.get_embedding_dimension()
+
+    def warmup(self) -> None:
+        if self._model is None:
+            return
+        _ = self._model.encode(["warmup"], convert_to_numpy=True, show_progress_bar=False)
 
     def encode(
         self,

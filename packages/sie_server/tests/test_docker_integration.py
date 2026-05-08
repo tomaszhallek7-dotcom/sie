@@ -146,8 +146,8 @@ class TestDockerGateway:
         assert response.status_code == 200
 
     def test_readiness_endpoint(self, sie_docker_gateway: str) -> None:
-        """Gateway Docker container responds to readiness probe."""
+        """Workerless gateway is ready so scale-from-zero requests can reach it."""
         response = httpx.get(f"{sie_docker_gateway}/readyz", timeout=10.0)
         assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "ready"
+        assert response.headers.get("content-type", "").startswith("text/plain")
+        assert response.text == "ok"

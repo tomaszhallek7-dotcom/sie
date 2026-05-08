@@ -64,11 +64,12 @@ Key options:
       --k8s-port <PORT>          K8s worker port (default: 8080)
   -l, --log-level <LEVEL>        Log level (default: info)
       --json-logs                Enable structured JSON logging
-      --health-mode <MODE>       Health mode: ws|nats (default: ws)
+      --health-mode <MODE>       Worker health transport (supported: ws; default: ws)
       --bundles-dir <PATH>       Bundles directory
       --models-dir <PATH>        Models directory
 
 sie-gateway version
+sie-gateway openapi --output packages/sie_gateway/openapi.json
 ```
 
 Each `--flag` above has a matching `SIE_*` environment variable (see next section); CLI flags override env vars.
@@ -84,7 +85,7 @@ Each `--flag` above has a matching `SIE_*` environment variable (see next sectio
 | `SIE_GATEWAY_K8S_NAMESPACE` | `default` | K8s namespace |
 | `SIE_GATEWAY_K8S_SERVICE` | `sie-worker` | K8s service name |
 | `SIE_GATEWAY_K8S_PORT` | `8080` | K8s worker port |
-| `SIE_GATEWAY_HEALTH_MODE` | `ws` | Health mode: `ws` or `nats` |
+| `SIE_GATEWAY_HEALTH_MODE` | `ws` | Worker health transport. Supported value: `ws`. `nats` is experimental/internal and requires a worker-side `sie.health.>` publisher, which is not wired by default |
 | `SIE_NATS_URL` | | NATS server URL. The process can start without it, but inference requests will return `503` until a usable client exists |
 | `SIE_AUTH_MODE` | `none` | Auth mode for inbound requests: `none` disables, `token` (alias `static`) enforces. Unknown values fail-open-to-bypass; `main` logs a startup error naming the bad value |
 | `SIE_AUTH_TOKENS` | | CSV of valid bearer tokens for inference and pool/config read endpoints. If unset, the singular `SIE_AUTH_TOKEN` is used as a fallback. When auth is enabled and this list is empty, non-probe requests return `500` |
@@ -114,10 +115,11 @@ Each `--flag` above has a matching `SIE_*` environment variable (see next sectio
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/` | HTML status page |
-| GET | `/healthz` | Liveness probe |
-| GET | `/readyz` | Readiness probe |
+| GET | `/healthz` | Liveness — **`200`**, **`text/plain`** body **`ok`** |
+| GET | `/readyz` | Readiness — **`200`** + **`ok`** once the gateway process is serving (**`text/plain`**); worker availability is exposed by `/health` |
 | GET | `/health` | Cluster health JSON |
 | GET | `/metrics` | Prometheus metrics |
+| GET | `/openapi.json` | OpenAPI 3 contract for gateway-owned HTTP routes |
 | GET | `/ws/cluster-status` | WebSocket cluster status feed |
 | GET | `/v1/models` | List available models |
 
@@ -142,6 +144,8 @@ Common behaviors:
 - `503` + `Retry-After` for no-consumer or backpressure publish failures
 - `503` + `X-SIE-Error-Code: MODEL_LOADING` + `Retry-After: 5` for queue result timeouts (typically a worker cold-loading the target model). SDK clients with `wait_for_capacity=True` retry under the existing `provision_timeout_s` budget.
 - `503` + `X-SIE-Error-Code: RESOURCE_EXHAUSTED` + `Retry-After: 5` when every item in a batch fails with the same retryable code (`RESOURCE_EXHAUSTED` from worker-side OOM recovery exhaustion, `MODEL_LOADING` from a worker still warming up). The SDK auto-retries with bounded exponential backoff. Mixed batches keep returning `500 all_items_failed` with per-item `code` fields in the response body so callers can see which items hit which failure mode.
+
+The same gateway-owned OpenAPI contract is available at runtime via `GET /openapi.json` and as a committed static artifact at `packages/sie_gateway/openapi.json`. Regenerate it with `mise run openapi` before committing API-surface changes.
 
 ### Pool Management
 

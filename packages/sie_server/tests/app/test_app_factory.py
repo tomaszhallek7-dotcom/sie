@@ -1,5 +1,6 @@
 """Tests for the FastAPI app factory."""
 
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -132,3 +133,67 @@ class TestPreloadModelsEnvRoundTrip:
         config.save_to_env_vars()
         restored = AppStateConfig.from_env_vars()
         assert restored.preload_models is None
+
+
+class TestConfigureTorchThreads:
+    def test_default_uses_half_cpu_count(self, monkeypatch) -> None:
+        monkeypatch.delenv("SIE_TORCH_NUM_THREADS", raising=False)
+        monkeypatch.setattr("sie_server.app.app_factory.os.cpu_count", lambda: 8)
+        set_n = MagicMock()
+        set_interop = MagicMock()
+        monkeypatch.setattr("sie_server.app.app_factory.torch.set_num_threads", set_n)
+        monkeypatch.setattr("sie_server.app.app_factory.torch.set_num_interop_threads", set_interop)
+        AppFactory._configure_torch_threads()
+        set_n.assert_called_once_with(4)
+        set_interop.assert_called_once_with(1)
+
+    def test_default_floor_when_cpu_count_is_none(self, monkeypatch) -> None:
+        monkeypatch.delenv("SIE_TORCH_NUM_THREADS", raising=False)
+        monkeypatch.setattr("sie_server.app.app_factory.os.cpu_count", lambda: None)
+        set_n = MagicMock()
+        monkeypatch.setattr("sie_server.app.app_factory.torch.set_num_threads", set_n)
+        monkeypatch.setattr("sie_server.app.app_factory.torch.set_num_interop_threads", MagicMock())
+        AppFactory._configure_torch_threads()
+        set_n.assert_called_once_with(2)
+
+    def test_env_override_honored(self, monkeypatch) -> None:
+        monkeypatch.setenv("SIE_TORCH_NUM_THREADS", "3")
+        set_n = MagicMock()
+        monkeypatch.setattr("sie_server.app.app_factory.torch.set_num_threads", set_n)
+        monkeypatch.setattr("sie_server.app.app_factory.torch.set_num_interop_threads", MagicMock())
+        AppFactory._configure_torch_threads()
+        set_n.assert_called_once_with(3)
+
+    def test_invalid_env_override_falls_back(self, monkeypatch, caplog) -> None:
+        monkeypatch.setenv("SIE_TORCH_NUM_THREADS", "abc")
+        monkeypatch.setattr("sie_server.app.app_factory.os.cpu_count", lambda: 8)
+        set_n = MagicMock()
+        monkeypatch.setattr("sie_server.app.app_factory.torch.set_num_threads", set_n)
+        monkeypatch.setattr("sie_server.app.app_factory.torch.set_num_interop_threads", MagicMock())
+        with caplog.at_level(logging.WARNING, logger="sie_server.app.app_factory"):
+            AppFactory._configure_torch_threads()
+        set_n.assert_called_once_with(4)
+        assert any("not a positive integer" in r.message for r in caplog.records)
+
+    def test_zero_env_override_falls_back(self, monkeypatch, caplog) -> None:
+        monkeypatch.setenv("SIE_TORCH_NUM_THREADS", "0")
+        monkeypatch.setattr("sie_server.app.app_factory.os.cpu_count", lambda: 8)
+        set_n = MagicMock()
+        monkeypatch.setattr("sie_server.app.app_factory.torch.set_num_threads", set_n)
+        monkeypatch.setattr("sie_server.app.app_factory.torch.set_num_interop_threads", MagicMock())
+        with caplog.at_level(logging.WARNING, logger="sie_server.app.app_factory"):
+            AppFactory._configure_torch_threads()
+        set_n.assert_called_once_with(4)
+        assert any("not a positive integer" in r.message for r in caplog.records)
+
+    def test_interop_runtime_error_is_swallowed(self, monkeypatch, caplog) -> None:
+        monkeypatch.delenv("SIE_TORCH_NUM_THREADS", raising=False)
+        monkeypatch.setattr("sie_server.app.app_factory.torch.set_num_threads", MagicMock())
+
+        def _raise(_n: int) -> None:
+            raise RuntimeError("parallel runtime already started")
+
+        monkeypatch.setattr("sie_server.app.app_factory.torch.set_num_interop_threads", _raise)
+        with caplog.at_level(logging.WARNING, logger="sie_server.app.app_factory"):
+            AppFactory._configure_torch_threads()  # must not raise
+        assert any("set_num_interop_threads" in r.message for r in caplog.records)

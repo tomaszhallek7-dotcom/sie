@@ -845,6 +845,45 @@ def test_qwen_qwen3_reranker_4b_score() -> None:
 
 
 # =============================================================================
+# Score (ColBERT / late-interaction MaxSim rerankers)
+# -----------------------------------------------------------------------------
+# Expected scores below are compared after casting both sides to float16
+# (see _assert_score), so the literal values are fp16 golden values — not
+# bit-exact bf16 outputs even when the adapter computes in bfloat16. A
+# precision/device/CUDA-version change can shift every value at once;
+# update them as a batch and bisect against a single trusted run.
+# =============================================================================
+
+
+def test_answerdotai_answerai_colbert_small_v1_score() -> None:
+    _assert_score("answerdotai/answerai-colbert-small-v1", [6.9140625])
+
+
+def test_colbert_ir_colbertv2_0_score() -> None:
+    _assert_score("colbert-ir/colbertv2.0", [29.890625])
+
+
+def test_jinaai_jina_colbert_v2_score() -> None:
+    _assert_score("jinaai/jina-colbert-v2", [27.953125])
+
+
+def test_lightonai_gte_moderncolbert_v1_score() -> None:
+    _assert_score("lightonai/GTE-ModernColBERT-v1", [30.296875])
+
+
+def test_lightonai_reason_moderncolbert_score() -> None:
+    _assert_score("lightonai/Reason-ModernColBERT", [29.578125])
+
+
+def test_mixedbread_ai_mxbai_colbert_large_v1_score() -> None:
+    _assert_score("mixedbread-ai/mxbai-colbert-large-v1", [6.19140625])
+
+
+def test_mixedbread_ai_mxbai_edge_colbert_v0_32m_score() -> None:
+    _assert_score("mixedbread-ai/mxbai-edge-colbert-v0-32m", [14.359375])
+
+
+# =============================================================================
 # Extract models (text input - GLiNER / NLI classification)
 # =============================================================================
 

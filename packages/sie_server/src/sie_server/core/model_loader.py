@@ -272,7 +272,7 @@ class ModelLoader:
             LoadedModel containing the loaded state.
         """
         logger.info("Loading model '%s' onto %s", name, device)
-        adapter.load(device)
+        _run_load_with_markers(name, device, adapter)
         return self._finish_load(name, device, adapter, config)
 
     async def load_and_register_async(
@@ -326,7 +326,7 @@ class ModelLoader:
 
         def _load_sync() -> LoadedModel:
             logger.info("Loading model '%s' onto %s", name, device)
-            adapter.load(device)
+            _run_load_with_markers(name, device, adapter)
             return self._finish_load(name, device, adapter, config)
 
         return await loop.run_in_executor(self._load_executor, _load_sync)
@@ -353,7 +353,7 @@ class ModelLoader:
             LoadedModel containing the loaded state.
         """
         logger.info("Loading model '%s' onto %s (main thread)", name, device)
-        adapter.load(device)
+        _run_load_with_markers(name, device, adapter)
         return self._finish_load(name, device, adapter, config)
 
     def _finish_load(
@@ -522,6 +522,23 @@ class ModelLoader:
     def shutdown(self) -> None:
         """Shutdown the loader's thread pool."""
         self._load_executor.shutdown(wait=False)
+
+
+def _run_load_with_markers(name: str, device: str, adapter: ModelAdapter) -> None:
+    """Drive ``adapter.load()`` then ``adapter.warmup()`` with cold-start log markers.
+
+    The four markers (``Model deserialize start/end`` and ``Model warmup start/end``)
+    let the multipod cold-start bench (schema v6) attribute deserialize and warmup
+    time separately. They are emitted unconditionally — adapters whose ``warmup()``
+    is a no-op still produce both warmup markers so the parser can attribute
+    consistently across adapters (the resulting ``warmup_s`` is just ~0).
+    """
+    logger.info("Model deserialize start: '%s' on %s", name, device)
+    adapter.load(device)
+    logger.info("Model deserialize end: '%s' on %s", name, device)
+    logger.info("Model warmup start: '%s' on %s", name, device)
+    adapter.warmup()
+    logger.info("Model warmup end: '%s' on %s", name, device)
 
 
 def _merge_adaptive_params(

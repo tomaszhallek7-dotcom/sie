@@ -48,10 +48,11 @@ dev = [
     "ipykernel>=7.1.0",
     "python-hcl2>=7.3.1",
     "pandas>=2.0",
-    "plotly>=5.0",
+    "plotly>=6.1.1",
     "statsmodels>=0.14",
     "marimo>=0.20.4",
     "modal>=0.73",
+    "kaleido>=1.3.0",
 ]
 benchview = [
     "datasets>=2.19,<4.0", # trust_remote_code support was removed in 4.0
@@ -215,6 +216,9 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"tools/loadtest_dashboard/scripts/*.py" = [
+    "INP001",  # JS project subdir; not a Python package
+]
 "**/tests/**/*" = [
     "ANN",     # Type annotations (tests don't need full typing)
     "ARG",     # Unused function arguments (fixtures)

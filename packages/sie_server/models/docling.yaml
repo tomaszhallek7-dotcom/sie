@@ -18,3 +18,11 @@ profiles:
     adapter_options:
       loadtime: {}
       runtime: {}
+  ocr:
+    max_batch_tokens: 1
+    compute_precision: null
+    adapter_path: sie_server.adapters.docling:DoclingAdapter
+    adapter_options:
+      loadtime: {}
+      runtime:
+        ocr: true

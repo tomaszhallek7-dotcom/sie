@@ -8,6 +8,7 @@ use crate::metrics;
 use crate::middleware::audit::AuditLayer;
 use crate::middleware::auth::AuthLayer;
 use crate::middleware::metrics::MetricsLayer;
+use crate::openapi;
 use crate::queue::publisher::WorkPublisher;
 use crate::state::config_epoch::ConfigEpoch;
 use crate::state::demand_tracker::DemandTracker;
@@ -24,7 +25,7 @@ pub struct AppState {
     pub demand_tracker: Arc<DemandTracker>,
     /// Monotonic view of the furthest-known control-plane epoch. Written by
     /// bootstrap, the NATS delta handler, and the epoch poller; read by
-    /// `/v1/configs/models/{id}/status` and `/health`.
+    /// `GET /v1/configs/models/{id}/status` and metrics (`sie_gateway_config_epoch`).
     pub config_epoch: ConfigEpoch,
 }
 
@@ -38,6 +39,8 @@ pub fn create_router(state: Arc<AppState>, config: Arc<Config>) -> Router {
         .route("/health", get(health::health))
         // Metrics endpoint
         .route("/metrics", get(metrics_handler))
+        // API description
+        .route("/openapi.json", get(openapi::openapi_json))
         // Models endpoints. `{*model}` accepts slash-bearing IDs.
         .route("/v1/models", get(models::get_models))
         .route("/v1/models/{*model}", get(models::get_model))
@@ -70,6 +73,7 @@ pub fn create_router(state: Arc<AppState>, config: Arc<Config>) -> Router {
         .route("/v1/configs/resolve", post(config_api::resolve_config))
         // WebSocket cluster status
         .route("/ws/cluster-status", get(health::ws_cluster_status))
+        .route("/v1/embeddings", post(proxy::proxy_openai_embeddings))
         // Proxy endpoints - use wildcard for model path
         .route("/v1/encode/{*model}", post(proxy::proxy_encode))
         .route("/v1/score/{*model}", post(proxy::proxy_score))
@@ -86,7 +90,13 @@ pub fn create_router(state: Arc<AppState>, config: Arc<Config>) -> Router {
         .with_state(state)
 }
 
-async fn metrics_handler(
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    tag = "observability",
+    responses((status = 200, description = "Prometheus metrics", body = String, content_type = "text/plain"))
+)]
+pub(crate) async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> impl axum::response::IntoResponse {
     // Update worker gauges before serving

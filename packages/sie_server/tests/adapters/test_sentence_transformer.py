@@ -80,6 +80,7 @@ class TestSentenceTransformerDenseAdapter:
         """Encode returns dense embeddings."""
         mock_st_class.return_value = mock_st_model
         adapter.load("cpu")
+        adapter.warmup()
 
         items = [Item(text="hello"), Item(text="world")]
         output = adapter.encode(items, output_types=["dense"])
@@ -88,7 +89,7 @@ class TestSentenceTransformerDenseAdapter:
         assert output.dense is not None
         assert output.dense[0].shape == (384,)
 
-        # First call is warmup during load, second is actual encode
+        # First call is warmup, second is actual encode
         assert mock_st_model.encode.call_count == 2
         call_args = mock_st_model.encode.call_args
         assert call_args[0][0] == ["hello", "world"]

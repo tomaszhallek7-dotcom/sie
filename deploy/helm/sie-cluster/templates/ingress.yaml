@@ -29,6 +29,13 @@ metadata:
   }}
   {{- $annotations = merge $annotations $authDefaults }}
   {{- end }}
+  {{- if and .Values.ingress.tls.enabled (eq .Values.ingress.tls.mode "cert-manager") }}
+  {{- $issuerAnnotation := ternary "cert-manager.io/cluster-issuer" "cert-manager.io/issuer" (eq .Values.ingress.tls.certManager.kind "ClusterIssuer") }}
+  {{- $issuerName := .Values.ingress.tls.certManager.name }}
+  {{- if not $issuerName }}{{ $issuerName = printf "%s-letsencrypt-prod" (include "sie-cluster.fullname" .) }}{{ end }}
+  {{- $cmDefaults := dict $issuerAnnotation $issuerName }}
+  {{- $annotations = merge $annotations $cmDefaults }}
+  {{- end }}
   {{- if $annotations }}
   annotations:
     {{- toYaml $annotations | nindent 4 }}

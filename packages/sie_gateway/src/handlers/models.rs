@@ -3,63 +3,124 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::server::AppState;
+use crate::state::model_registry::ModelRegistry;
+use crate::types::model::{ModelEntry, ModelInfoExtras};
 
+#[utoipa::path(
+    get,
+    path = "/v1/models",
+    tag = "models",
+    responses((status = 200, description = "Models visible to this gateway replica", body = crate::openapi::ModelsResponse))
+)]
 pub async fn get_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let model_workers = state.registry.get_models().await;
+    let model_workers =
+        canonical_worker_models(state.registry.get_models().await, &state.model_registry);
 
-    let all_model_names = state.model_registry.list_models();
-    let models: Vec<serde_json::Value> = if !all_model_names.is_empty() {
-        all_model_names
-            .iter()
-            .map(|name| {
-                let worker_urls = model_workers.get(name).cloned().unwrap_or_default();
-                let bundles = state.model_registry.get_model_bundles(name);
-                build_model_payload(name, &bundles, &worker_urls)
-            })
-            .collect()
-    } else {
-        model_workers
-            .into_iter()
-            .map(|(name, urls)| build_model_payload(&name, &[], &urls))
-            .collect()
-    };
+    let model_names: BTreeSet<String> = state
+        .model_registry
+        .list_models()
+        .into_iter()
+        .chain(model_workers.keys().cloned())
+        .collect();
+    let models: Vec<serde_json::Value> = model_names
+        .iter()
+        .map(|name| {
+            let worker_urls = model_workers.get(name).cloned().unwrap_or_default();
+            let loaded = !worker_urls.is_empty();
+            match state.model_registry.get_model_info(name) {
+                Some(entry) => entry.to_model_info_value(loaded),
+                None => worker_only_model_info(name, loaded),
+            }
+        })
+        .collect();
 
     (StatusCode::OK, Json(json!({"models": models}))).into_response()
 }
 
 /// Detail counterpart to `get_models`.
+#[utoipa::path(
+    get,
+    path = "/v1/models/{model}",
+    tag = "models",
+    params(("model" = String, Path, description = "Model id; percent-encode slashes when using OpenAPI-generated clients")),
+    responses(
+        (status = 200, description = "Model detail", body = crate::openapi::ModelInfoWire),
+        (status = 404, description = "Model not found", body = crate::openapi::ModelNotFoundResponse)
+    )
+)]
 pub async fn get_model(Path(model): Path<String>, State(state): State<Arc<AppState>>) -> Response {
-    let known_in_registry = state.model_registry.get_model_info(&model).is_some();
+    let model_entry = state.model_registry.get_model_info(&model);
+    let known_in_registry = model_entry.is_some();
+    let canonical_model = model_entry
+        .as_ref()
+        .map(|entry| entry.name.as_str())
+        .unwrap_or(model.as_str());
     let bundles = state.model_registry.get_model_bundles(&model);
-    let model_workers = state.registry.get_models().await;
-    let worker_urls = model_workers.get(&model).cloned().unwrap_or_default();
+    let model_workers =
+        canonical_worker_models(state.registry.get_models().await, &state.model_registry);
+    let worker_urls = model_workers
+        .get(canonical_model)
+        .cloned()
+        .unwrap_or_default();
 
     if !known_in_registry && bundles.is_empty() && worker_urls.is_empty() {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({"message": format!("Model '{}' not found", model)})),
+            Json(json!({
+                "detail": {
+                    "code": "MODEL_NOT_FOUND",
+                    "message": format!("Model '{}' not found", model),
+                }
+            })),
         )
             .into_response();
     }
 
-    (
-        StatusCode::OK,
-        Json(build_model_payload(&model, &bundles, &worker_urls)),
-    )
-        .into_response()
+    let loaded = !worker_urls.is_empty();
+    let body = match model_entry {
+        Some(entry) => entry.to_model_info_value(loaded),
+        None => worker_only_model_info(&model, loaded),
+    };
+
+    (StatusCode::OK, Json(body)).into_response()
 }
 
-fn build_model_payload(name: &str, bundles: &[String], worker_urls: &[String]) -> Value {
-    json!({
-        "name": name,
-        "bundles": bundles,
-        "worker_count": worker_urls.len(),
-        "workers": worker_urls,
-        "loaded": !worker_urls.is_empty(),
-    })
+fn canonical_worker_models(
+    model_workers: HashMap<String, Vec<String>>,
+    model_registry: &ModelRegistry,
+) -> HashMap<String, Vec<String>> {
+    let mut normalized: HashMap<String, Vec<String>> = HashMap::new();
+    for (model, urls) in model_workers {
+        let canonical = model_registry
+            .get_model_info(&model)
+            .map(|entry| entry.name)
+            .unwrap_or(model);
+        normalized.entry(canonical).or_default().extend(urls);
+    }
+    normalized
+}
+
+/// ``ModelInfo``-shaped JSON when workers advertise a model id that is not
+/// present in the local registry snapshot (bootstrap / race window).
+fn worker_only_model_info(name: &str, loaded: bool) -> Value {
+    ModelEntry {
+        name: name.to_string(),
+        bundles: Vec::new(),
+        adapter_modules: HashSet::new(),
+        profile_names: HashSet::new(),
+        profile_configs: HashMap::new(),
+        info_extras: ModelInfoExtras {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            dims: HashMap::new(),
+            max_sequence_length: None,
+        },
+    }
+    .to_model_info_value(loaded)
 }
 
 pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -283,6 +344,9 @@ mod route_tests {
                 adapter_module: None,
                 default_bundle: None,
                 profiles,
+                inputs: None,
+                tasks: None,
+                max_sequence_length: None,
             })
             .unwrap();
     }
@@ -334,6 +398,80 @@ mod route_tests {
     }
 
     #[tokio::test]
+    async fn test_list_models_includes_registry_and_worker_only_models() {
+        let (app, state, _bundles_dir, _models_dir) = build_router_with_state().await;
+        seed_model(&state, "BAAI/bge-m3");
+        state
+            .registry
+            .update_worker(
+                "http://worker-1:8080",
+                worker_msg("worker-1", vec!["worker/only".to_string()]),
+            )
+            .await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let models = body["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+
+        let by_name: HashMap<_, _> = models
+            .iter()
+            .map(|model| (model["name"].as_str().unwrap(), model))
+            .collect();
+        assert_eq!(by_name["BAAI/bge-m3"]["loaded"], false);
+        assert_eq!(by_name["worker/only"]["loaded"], true);
+        assert!(by_name["worker/only"]["inputs"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(by_name["worker/only"]["outputs"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_models_canonicalizes_worker_model_names() {
+        let (app, state, _bundles_dir, _models_dir) = build_router_with_state().await;
+        seed_model(&state, "BAAI/bge-m3");
+        state
+            .registry
+            .update_worker(
+                "http://worker-1:8080",
+                worker_msg("worker-1", vec!["baai/BGE-M3".to_string()]),
+            )
+            .await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let models = body["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["name"], "BAAI/bge-m3");
+        assert_eq!(models[0]["loaded"], true);
+        assert_eq!(models[0]["state"], "loaded");
+    }
+
+    #[tokio::test]
     async fn test_get_model_detail_known_model_no_workers() {
         let (app, state, _bundles_dir, _models_dir) = build_router_with_state().await;
         seed_model(&state, "BAAI/bge-m3");
@@ -352,9 +490,9 @@ mod route_tests {
         let body = body_json(response).await;
         assert_eq!(body["name"], "BAAI/bge-m3");
         assert_eq!(body["loaded"], false);
-        assert_eq!(body["worker_count"], 0);
-        assert!(body["workers"].as_array().unwrap().is_empty());
-        assert!(!body["bundles"].as_array().unwrap().is_empty());
+        assert_eq!(body["state"], "available");
+        assert!(!body["inputs"].as_array().unwrap().is_empty());
+        assert!(body["profiles"].is_object());
     }
 
     #[tokio::test]
@@ -383,11 +521,36 @@ mod route_tests {
         let body = body_json(response).await;
         assert_eq!(body["name"], "BAAI/bge-m3");
         assert_eq!(body["loaded"], true);
-        assert_eq!(body["worker_count"], 1);
-        assert_eq!(
-            body["workers"].as_array().unwrap()[0],
-            "http://worker-1:8080"
-        );
+        assert_eq!(body["state"], "loaded");
+    }
+
+    #[tokio::test]
+    async fn test_get_model_detail_canonicalizes_worker_model_names() {
+        let (app, state, _bundles_dir, _models_dir) = build_router_with_state().await;
+        seed_model(&state, "BAAI/bge-m3");
+        state
+            .registry
+            .update_worker(
+                "http://worker-1:8080",
+                worker_msg("worker-1", vec!["baai/BGE-M3".to_string()]),
+            )
+            .await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models/baai/bge-m3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["name"], "BAAI/bge-m3");
+        assert_eq!(body["loaded"], true);
+        assert_eq!(body["state"], "loaded");
     }
 
     #[tokio::test]
@@ -407,7 +570,11 @@ mod route_tests {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = body_json(response).await;
-        assert!(body["message"].as_str().unwrap().contains("does/not/exist"));
+        assert_eq!(body["detail"]["code"], "MODEL_NOT_FOUND");
+        assert!(body["detail"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does/not/exist"));
     }
 
     #[tokio::test]
@@ -426,6 +593,10 @@ mod route_tests {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = body_json(response).await;
-        assert!(body["message"].as_str().unwrap().contains("anything"));
+        assert_eq!(body["detail"]["code"], "MODEL_NOT_FOUND");
+        assert!(body["detail"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("anything"));
     }
 }

@@ -57,6 +57,31 @@ When a pool is scaling from zero, the gateway returns:
 
 The SDK handles this automatically with configurable retries.
 
+## Cluster model cache (S3/GCS)
+
+Pre-populate a shared bucket with model weights so worker pods don't re-download from HuggingFace on every cold start. The Python SDK pulls from the bucket first and falls back to HF on miss.
+
+**AWS (Terraform-managed bucket):**
+
+```bash
+# 1. Provision the bucket via the AWS Terraform module (opt-in via create_model_cache=true)
+cd deploy/terraform/aws/examples/dev-g6-spot
+terraform apply
+
+# 2. One-time populate from your laptop
+sie-admin cache weights sync --bundle default \
+  --dest $(terraform output -raw model_cache_bucket_url)/
+
+# 3. Wire into Helm
+helm upgrade --install sie-cluster . \
+  --set workers.common.clusterCache.enabled=true \
+  --set workers.common.clusterCache.url=$(terraform output -raw model_cache_bucket_url)
+```
+
+The Terraform output already includes the `/models` prefix, so the same URL is used for both `sie-admin --target` and `clusterCache.url`.
+
+**Other clouds / BYO bucket:** point `workers.common.clusterCache.url` at any `s3://...` or `gs://...` URL the workload Service Account can read; populate it with the same `sie-admin cache weights sync --dest ...` command.
+
 ## Autoscaling
 
 KEDA-based autoscaling with scale-to-zero support:
@@ -110,6 +135,88 @@ autoscaling:
   enabled: true
   cooldownPeriod: 600  # 10 min before scale-down
 ```
+
+## TLS / HTTPS
+
+The chart supports two TLS modes for the Ingress (set via `ingress.tls.mode`):
+
+- `byo` — bring your own `kubernetes.io/tls` Secret (default, backward compatible).
+- `cert-manager` — chart annotates the Ingress; [cert-manager](https://cert-manager.io/) provisions and renews the certificate via ACME (HTTP-01 challenge to Let's Encrypt by default).
+
+Only HTTP-01 ACME challenges are supported by the chart. DNS-01 / wildcard certs (which require cloud-provider IRSA / Workload Identity for Route53 / Cloud DNS) are out of scope — set them up manually outside the chart and reference the resulting Secret via `mode: byo`.
+
+### BYO certificate
+
+Create the TLS Secret yourself (e.g. from a corporate CA, ACM cert exported to a Secret, or an existing wildcard cert), then point the chart at it:
+
+```bash
+kubectl -n sie create secret tls sie-tls --cert=path/to/tls.crt --key=path/to/tls.key
+```
+
+```yaml
+ingress:
+  enabled: true
+  className: nginx
+  host: sie.example.com
+  tls:
+    enabled: true
+    mode: byo            # default
+    secretName: sie-tls  # default
+```
+
+### cert-manager + Let's Encrypt
+
+Prerequisite: install cert-manager once in the cluster (its CRDs are cluster-scoped and must exist exactly once — that's why it is **not** bundled as a subchart):
+
+```bash
+helm repo add jetstack https://charts.jetstack.io && helm repo update
+helm install cert-manager jetstack/cert-manager \
+  --set crds.enabled=true -n cert-manager --create-namespace
+```
+
+Then enable cert-manager mode in your SIE values:
+
+```yaml
+ingress:
+  enabled: true
+  className: nginx
+  host: sie.example.com
+  tls:
+    enabled: true
+    mode: cert-manager
+    certManager:
+      email: ops@example.com
+      # Use Let's Encrypt staging while iterating to avoid the 50 new-cert/registered-domain/week prod limit (duplicate-cert limit is 5/week):
+      # server: https://acme-staging-v02.api.letsencrypt.org/directory
+      kind: ClusterIssuer  # cluster-scoped; share across namespaces. Use "Issuer" for namespace-scoped.
+      create: true         # chart renders the Issuer/ClusterIssuer
+```
+
+The chart renders a `{kind}` named `{release-fullname}-letsencrypt-prod` (release-scoped to avoid collisions when multiple SIE releases share a cluster) and adds the appropriate `cert-manager.io/cluster-issuer` (or `/issuer`) annotation to the main Ingress. cert-manager populates `ingress.tls.secretName` (default `sie-tls`); the same Secret is referenced by the oauth2-proxy Ingress when auth is enabled.
+
+Note: Helm's standard `fullname` collapses when the release name already contains the chart name, so `helm install sie-cluster …` produces `sie-cluster-letsencrypt-prod` (not `sie-cluster-sie-cluster-letsencrypt-prod`). If you override `certManager.name`, set the full intended name explicitly rather than expecting a particular default.
+
+Issuer kind tradeoff:
+
+- `ClusterIssuer` — single ACME account / private key shared across all namespaces. Best for shared clusters.
+- `Issuer` — namespace-scoped. Use for hard tenant isolation, or when you don't have permission to create cluster-scoped resources.
+
+### Reusing an existing ClusterIssuer/Issuer
+
+In multi-tenant clusters where a platform team already manages a shared `ClusterIssuer`, set `create: false` and reference it by name:
+
+```yaml
+ingress:
+  tls:
+    enabled: true
+    mode: cert-manager
+    certManager:
+      kind: ClusterIssuer
+      create: false
+      name: platform-letsencrypt-prod
+```
+
+The chart only adds the annotation — it does not render any Issuer resource.
 
 ## Gated Models
 
@@ -196,6 +303,14 @@ Tag non-production deployments to filter them out of dashboards:
 telemetry:
   deploymentEnv: staging  # production (default) | staging | development | ci
 ```
+
+> **Internal Superlinked clusters:** any cluster owned by Superlinked that is
+> not a customer-facing production install MUST set `telemetry.deploymentEnv`
+> to one of `staging | development | ci`. The chart default is `production`
+> so that customer Helm installs are correctly tagged out of the box; internal
+> stacks must opt out explicitly to keep them out of the production telemetry
+> dashboards. See `deploy/terraform/{aws,gcp}/internal-examples/` for the
+> per-cluster mapping.
 
 ## Observability
 

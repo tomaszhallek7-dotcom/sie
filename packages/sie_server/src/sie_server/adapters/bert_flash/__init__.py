@@ -172,6 +172,7 @@ class BertFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             self._max_seq_length,
         )
 
+    def warmup(self) -> None:
         # Warmup flash attention kernels
         logger.info("Warming up CUDA kernels...")
         warmup_items = [Item(text="warmup")]

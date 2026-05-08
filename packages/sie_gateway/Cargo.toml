@@ -1,6 +1,6 @@
 [package]
 name = "sie-gateway"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 publish = false
 
@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -66,6 +67,7 @@ percent-encoding = "2"
 # Cloud config store backends (opt-in)
 object_store = { version = "0.11", optional = true, features = ["aws", "gcp"] }
 url = { version = "2", optional = true }
+utoipa = "5.4.0"
 
 [features]
 default = []

@@ -45,6 +45,16 @@ machineProfiles:
 ingress:
   enabled: true
   className: nginx
+  # TLS defaults to BYO (user-supplied kubernetes.io/tls Secret).
+  # To enable automated HTTPS via cert-manager + Let's Encrypt, install cert-manager
+  # in the cluster (one-time prerequisite) and uncomment:
+  #
+  # host: sie.example.com  # required when tls.mode=cert-manager
+  # tls:
+  #   enabled: true
+  #   mode: cert-manager
+  #   certManager:
+  #     email: ops@example.com
 
 gateway:
   # HA configuration to match GCP

@@ -239,6 +239,43 @@ Fails if nats.install=true but nats.enabled=false (NATS deploys but nothing conn
 {{- end }}
 
 {{/*
+Validation: TLS configuration consistency.
+Runs from NOTES.txt so every install/upgrade is checked, regardless of which (or no) Issuer template renders.
+*/}}
+{{- define "sie-cluster.validateTls" -}}
+{{- if .Values.ingress.tls.enabled }}
+{{- $mode := .Values.ingress.tls.mode }}
+{{- if not (or (eq $mode "byo") (eq $mode "cert-manager")) }}
+{{- fail (printf "Invalid configuration: ingress.tls.mode=%q. Must be one of: \"byo\", \"cert-manager\"." $mode) }}
+{{- end }}
+{{- if eq $mode "cert-manager" }}
+{{- if not .Values.ingress.host }}
+{{- fail "Invalid configuration: ingress.tls.mode=cert-manager requires ingress.host to be set (cert-manager has nothing to issue a certificate against without a hostname)." }}
+{{- end }}
+{{- $kind := .Values.ingress.tls.certManager.kind }}
+{{- if not (or (eq $kind "ClusterIssuer") (eq $kind "Issuer")) }}
+{{- fail (printf "Invalid configuration: ingress.tls.certManager.kind=%q. Must be either \"ClusterIssuer\" or \"Issuer\" (case-sensitive)." $kind) }}
+{{- end }}
+{{- if .Values.ingress.tls.certManager.create }}
+{{- if not .Values.ingress.tls.certManager.server }}
+{{- fail "Invalid configuration: ingress.tls.certManager.create=true requires ingress.tls.certManager.server to be set (ACME directory URL is required)." }}
+{{- end }}
+{{- if not .Values.ingress.tls.certManager.privateKeySecretRef }}
+{{- fail "Invalid configuration: ingress.tls.certManager.create=true requires ingress.tls.certManager.privateKeySecretRef to be set (ACME account key Secret name is required)." }}
+{{- end }}
+{{- if not .Values.ingress.tls.certManager.email }}
+{{- fail "Invalid configuration: ingress.tls.certManager.create=true requires ingress.tls.certManager.email to be set (ACME account registration needs an email)." }}
+{{- end }}
+{{- else }}
+{{- if not .Values.ingress.tls.certManager.name }}
+{{- fail "Invalid configuration: ingress.tls.certManager.create=false requires ingress.tls.certManager.name to be set (without a name there is no existing Issuer/ClusterIssuer to annotate against)." }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
 KEDA apply hook: ServiceAccount name
 */}}
 {{- define "sie-cluster.keda.apply.serviceAccountName" -}}

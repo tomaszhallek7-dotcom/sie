@@ -127,6 +127,20 @@ class ModelAdapter(ABC):
             device: Device string (e.g., "cuda:0", "cpu").
         """
 
+    def warmup(self) -> None:
+        """Run a warmup forward pass on the loaded model.
+
+        Called by the model loader after ``load()`` has completed. The default
+        implementation is a no-op for adapters that do not need warmup. Adapters
+        that compile kernels on first call (e.g. flash-attention) or otherwise
+        benefit from a priming pass should override this and run a single
+        inference pass against a tiny synthetic input.
+
+        Splitting this from ``load()`` lets the cold-start instrumentation
+        attribute deserialize and warmup time separately.
+        """
+        return
+
     @abstractmethod
     def unload(self) -> None:
         """Unload the model and free resources.

@@ -44,7 +44,10 @@ WORKDIR /app
 COPY packages/sie_sdk/pyproject.toml /tmp/sie_sdk/pyproject.toml
 COPY packages/sie_server/pyproject.toml ./pyproject.toml
 
-RUN mkdir -p /tmp/sie_sdk/src/sie_sdk src/sie_server \
+# Stubs for editable metadata generation — bundles/ and models/ are referenced
+# by force-include in pyproject.toml and must exist; real contents are copied
+# in the base stage.
+RUN mkdir -p /tmp/sie_sdk/src/sie_sdk src/sie_server bundles models \
     && touch /tmp/sie_sdk/src/sie_sdk/__init__.py \
     && touch src/sie_server/__init__.py
 

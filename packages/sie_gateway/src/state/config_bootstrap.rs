@@ -28,9 +28,14 @@
 //!   backoff (capped) until it succeeds. Every successful fetch is applied
 //!   into the shared `ModelRegistry` and stored as the current `ConfigEpoch`.
 //! - While bootstrap has not yet succeeded, API-added models from
-//!   `sie-config` are missing. `/readyz` still reports ready (soft-degraded,
-//!   not an outage), and `/health` exposes `config_epoch` so operators can
-//!   see catch-up progress.
+//!   `sie-config` are missing. `GET /readyz` is process readiness only: once
+//!   the gateway listener is serving it returns **200** + plain text `ok`, even
+//!   with zero workers, so the first inference request can reach the gateway and
+//!   trigger scale-from-zero via `202 + Retry-After`. Bootstrap catch-up is
+//!   visible separately via `GET /v1/configs/models/{id}/status` (`config_epoch`
+//!   on that payload), the `sie_gateway_config_epoch` /
+//!   `sie_gateway_config_bootstrap_degraded` metrics, and gateway logs — not
+//!   via `/readyz` flipping on export completion.
 //! - `state::config_poller` runs in parallel, periodically reconciling
 //!   against `GET /v1/configs/epoch` so any missed NATS deltas after the
 //!   initial bootstrap are caught within one poll interval.

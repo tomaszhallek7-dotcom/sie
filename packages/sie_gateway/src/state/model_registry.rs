@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use crate::types::bundle::BundleInfo;
-use crate::types::model::{CanonicalProfile, ModelConfig, ModelEntry};
+use crate::types::model::{CanonicalProfile, ModelConfig, ModelEntry, ModelInfoExtras};
 
 #[derive(Debug)]
 pub struct ModelNotFoundError {
@@ -297,6 +297,7 @@ impl ModelRegistry {
         let content = std::fs::read_to_string(path)?;
         let config: ModelConfig = serde_yaml::from_str(&content)?;
 
+        let info_extras = crate::types::model::ModelInfoExtras::from_model_config(&config);
         let model_name = config.name;
         let mut adapter_modules: HashSet<String> = HashSet::new();
         let mut profile_names: HashSet<String> = HashSet::new();
@@ -322,6 +323,7 @@ impl ModelRegistry {
             adapter_modules,
             profile_names,
             profile_configs,
+            info_extras,
         })
     }
 
@@ -684,6 +686,7 @@ impl ModelRegistry {
                         .insert(pname.clone(), CanonicalProfile::from_profile(profile));
                 }
             }
+            Self::merge_model_info_extras(&mut existing.info_extras, &config);
         } else {
             // New model
             let mut profile_names: HashSet<String> = HashSet::new();
@@ -696,6 +699,7 @@ impl ModelRegistry {
 
             created_profiles = config.profiles.keys().cloned().collect();
 
+            let info_extras = ModelInfoExtras::from_model_config(&config);
             snap.models.insert(
                 sie_id.clone(),
                 ModelEntry {
@@ -704,6 +708,7 @@ impl ModelRegistry {
                     adapter_modules: new_adapter_modules,
                     profile_names,
                     profile_configs,
+                    info_extras,
                 },
             );
             snap.model_names_lower
@@ -760,6 +765,25 @@ impl ModelRegistry {
         self.snapshot.store(Arc::new(snap));
 
         Ok((created_profiles, skipped_profiles, affected_bundles))
+    }
+
+    fn merge_model_info_extras(existing: &mut ModelInfoExtras, config: &ModelConfig) {
+        if config.inputs.is_none() && config.tasks.is_none() && config.max_sequence_length.is_none()
+        {
+            return;
+        }
+
+        let refreshed = ModelInfoExtras::from_model_config(config);
+        if config.inputs.is_some() {
+            existing.inputs = refreshed.inputs;
+        }
+        if config.tasks.is_some() {
+            existing.outputs = refreshed.outputs;
+            existing.dims = refreshed.dims;
+        }
+        if config.max_sequence_length.is_some() {
+            existing.max_sequence_length = refreshed.max_sequence_length;
+        }
     }
 }
 
@@ -821,6 +845,9 @@ mod tests {
                 adapter_module: None,
                 default_bundle: None,
                 profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: None,
             })
             .unwrap();
         assert!(registry.has_any_models(), "must report populated after add");
@@ -871,6 +898,9 @@ mod tests {
                         adapter_module: None,
                         default_bundle: None,
                         profiles,
+                        inputs: None,
+                        max_sequence_length: None,
+                        tasks: None,
                     };
                     registry.add_model_config(cfg).expect("add must succeed");
                 }
@@ -1072,6 +1102,9 @@ adapters:
                 );
                 m
             },
+            inputs: None,
+            max_sequence_length: None,
+            tasks: None,
         };
 
         let (created, skipped, bundles) = registry.add_model_config(config).unwrap();
@@ -1082,6 +1115,198 @@ adapters:
         assert!(registry.model_exists("test/model"));
         let resolved = registry.resolve_bundle("test/model", None).unwrap();
         assert_eq!(resolved, "default");
+    }
+
+    #[test]
+    fn test_add_model_config_refreshes_existing_model_info_extras() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            r#"
+name: default
+priority: 10
+adapters:
+  - module
+"#,
+        )
+        .unwrap();
+
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "default".to_string(),
+            crate::types::model::ProfileConfig {
+                adapter_path: Some("module:Adapter".to_string()),
+                max_batch_tokens: Some(4096),
+                compute_precision: None,
+                adapter_options: None,
+                extends: None,
+            },
+        );
+        registry
+            .add_model_config(ModelConfig {
+                name: "test/model".to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: Some(512),
+                tasks: Some(
+                    serde_yaml::from_str(
+                        r#"
+encode:
+  dense:
+    dim: 384
+"#,
+                    )
+                    .unwrap(),
+                ),
+            })
+            .unwrap();
+
+        let first = registry.get_model_info("test/model").unwrap();
+        assert_eq!(first.info_extras.outputs, vec!["dense"]);
+        assert_eq!(first.info_extras.dims["dense"], 384);
+        assert_eq!(first.info_extras.max_sequence_length, Some(512));
+
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "default".to_string(),
+            crate::types::model::ProfileConfig {
+                adapter_path: Some("module:Adapter".to_string()),
+                max_batch_tokens: Some(4096),
+                compute_precision: None,
+                adapter_options: None,
+                extends: None,
+            },
+        );
+        profiles.insert(
+            "alt".to_string(),
+            crate::types::model::ProfileConfig {
+                adapter_path: Some("module:Adapter".to_string()),
+                max_batch_tokens: Some(2048),
+                compute_precision: None,
+                adapter_options: None,
+                extends: None,
+            },
+        );
+
+        registry
+            .add_model_config(ModelConfig {
+                name: "test/model".to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: Some(1024),
+                tasks: Some(
+                    serde_yaml::from_str(
+                        r#"
+encode:
+  sparse:
+    dim: 30000
+"#,
+                    )
+                    .unwrap(),
+                ),
+            })
+            .unwrap();
+
+        let refreshed = registry.get_model_info("test/model").unwrap();
+        assert!(refreshed.profile_names.contains("alt"));
+        assert_eq!(refreshed.info_extras.outputs, vec!["sparse"]);
+        assert_eq!(refreshed.info_extras.dims["sparse"], 30000);
+        assert_eq!(refreshed.info_extras.max_sequence_length, Some(1024));
+    }
+
+    #[test]
+    fn test_add_model_config_preserves_info_extras_for_profile_only_update() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            r#"
+name: default
+priority: 10
+adapters:
+  - module
+"#,
+        )
+        .unwrap();
+
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "default".to_string(),
+            crate::types::model::ProfileConfig {
+                adapter_path: Some("module:Adapter".to_string()),
+                max_batch_tokens: Some(4096),
+                compute_precision: None,
+                adapter_options: None,
+                extends: None,
+            },
+        );
+        registry
+            .add_model_config(ModelConfig {
+                name: "test/model".to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: Some(512),
+                tasks: Some(
+                    serde_yaml::from_str(
+                        r#"
+encode:
+  dense:
+    dim: 384
+"#,
+                    )
+                    .unwrap(),
+                ),
+            })
+            .unwrap();
+
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "default".to_string(),
+            crate::types::model::ProfileConfig {
+                adapter_path: Some("module:Adapter".to_string()),
+                max_batch_tokens: Some(4096),
+                compute_precision: None,
+                adapter_options: None,
+                extends: None,
+            },
+        );
+        profiles.insert(
+            "alt".to_string(),
+            crate::types::model::ProfileConfig {
+                adapter_path: Some("module:Adapter".to_string()),
+                max_batch_tokens: Some(2048),
+                compute_precision: None,
+                adapter_options: None,
+                extends: None,
+            },
+        );
+
+        registry
+            .add_model_config(ModelConfig {
+                name: "test/model".to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: None,
+            })
+            .unwrap();
+
+        let refreshed = registry.get_model_info("test/model").unwrap();
+        assert!(refreshed.profile_names.contains("alt"));
+        assert_eq!(refreshed.info_extras.outputs, vec!["dense"]);
+        assert_eq!(refreshed.info_extras.dims["dense"], 384);
+        assert_eq!(refreshed.info_extras.max_sequence_length, Some(512));
     }
 
     #[test]
@@ -1174,6 +1399,9 @@ adapters:
                         );
                         m
                     },
+                    inputs: None,
+                    max_sequence_length: None,
+                    tasks: None,
                 };
                 reg.add_model_config(config).expect("add_model_config");
             }));

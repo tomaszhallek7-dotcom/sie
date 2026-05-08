@@ -1,11 +1,25 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
+
+import numpy as np
+
+from sie_server.core.inference_output import ScoreOutput
 
 if TYPE_CHECKING:
     import torch
 
     from sie_server.types.inputs import Item
+
+
+class _ScoreFn(Protocol):
+    def __call__(
+        self,
+        query: Item,
+        items: list[Item],
+        *,
+        instruction: str | None = ...,
+    ) -> list[float]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -140,3 +154,67 @@ def resolve_embedding_options(
         opts.get("query_template", default_query_template),
         opts.get("doc_template", default_doc_template),
     )
+
+
+# ---------------------------------------------------------------------------
+# Score-pair grouping (shared by ColBERT-family adapters)
+# ---------------------------------------------------------------------------
+
+
+def grouped_score_pairs(
+    score_fn: _ScoreFn,
+    queries: list[Item],
+    docs: list[Item],
+    *,
+    instruction: str | None = None,
+) -> ScoreOutput:
+    """Run a per-query ``score()`` callable over parallel (query, doc) pairs.
+
+    Groups pairs by ``(query.text, query.id, instruction)`` so each unique
+    query is encoded once and its docs are scored as one batch. Used by
+    ColBERT-family adapters to satisfy the worker's ``score_pairs()``
+    contract while reusing the optimized batched ``score()``.
+
+    Queries with ``text is None`` are not supported and raise ``ValueError``
+    (ColBERT scoring requires text). The grouping key is
+    ``(query.text, query.id or "", instruction or "")`` — two distinct
+    ``Item`` objects with identical text/id/instruction collapse to one
+    encoding pass.
+
+    Args:
+        score_fn: Bound ``adapter.score(query, items, *, instruction=None)``.
+        queries: Query items (parallel to docs).
+        docs: Document items to score.
+        instruction: Optional instruction passed through to ``score_fn``.
+
+    Returns:
+        ``ScoreOutput`` with one float per pair, in the original input order.
+
+    Raises:
+        ValueError: If ``queries`` and ``docs`` lengths differ, or any query
+            lacks text.
+    """
+    if len(queries) != len(docs):
+        msg = f"queries and docs must be parallel; got {len(queries)} vs {len(docs)}"
+        raise ValueError(msg)
+
+    if not docs:
+        return ScoreOutput(scores=np.zeros(0, dtype=np.float32), batch_size=0)
+
+    groups: dict[tuple[str, str, str], list[int]] = {}
+    for i, q in enumerate(queries):
+        if q.text is None:
+            msg = f"grouped_score_pairs requires queries[{i}].text; got None"
+            raise ValueError(msg)
+        key = (q.text, q.id or "", instruction or "")
+        groups.setdefault(key, []).append(i)
+
+    scores = np.zeros(len(docs), dtype=np.float32)
+    for indices in groups.values():
+        q = queries[indices[0]]
+        group_docs = [docs[i] for i in indices]
+        group_scores = score_fn(q, group_docs, instruction=instruction)
+        for idx, s in zip(indices, group_scores, strict=True):
+            scores[idx] = float(s)
+
+    return ScoreOutput(scores=scores, batch_size=len(docs))

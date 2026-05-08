@@ -14,9 +14,20 @@ from sie_server.main import run_server
 
 logger = logging.getLogger(__name__)
 
-# Default bundles directory relative to sie_server package
-_DEFAULT_BUNDLES_DIR = Path(__file__).parent.parent.parent / "bundles"
-DEFAULT_MODELS_DIR = str(Path(str(sie_server.__file__)).parent.parent.parent / "models")
+
+# Prefer the package-internal location so a fresh `pip install sie-server`
+# followed by `sie-server serve` works out of the box (issue #820).
+def _resolve_default_dir(name: str) -> Path:
+    pkg_dir = Path(sie_server.__file__).parent
+    bundled = pkg_dir / name
+    if bundled.is_dir():
+        return bundled
+    # Fallback: source/dev layout (packages/sie_server/<name>)
+    return pkg_dir.parent.parent / name
+
+
+_DEFAULT_BUNDLES_DIR = _resolve_default_dir("bundles")
+DEFAULT_MODELS_DIR = str(_resolve_default_dir("models"))
 
 
 def detect_device() -> str:

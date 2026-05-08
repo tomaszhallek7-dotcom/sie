@@ -91,6 +91,23 @@ config:
     adminTokenSecretName: ""
     adminTokenSecretKey: "SIE_ADMIN_TOKEN"
 
+  # -- Liveness/readiness/startup probe timing. The httpGet path/port are
+  # contracts owned by the template (sie-config exposes /healthz and /readyz);
+  # only the timing fields below are overridable. Defaults match the previous
+  # hardcoded values (modulo the dropped startupProbe.initialDelaySeconds).
+  probes:
+    startup:
+      periodSeconds: 5
+      failureThreshold: 12
+    liveness:
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    readiness:
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 3
+
   # -- Persistent config store for sie-config. Owned by sie-config only (the
   # gateway no longer persists config). Keep enabled=false in test clusters where
   # the pod can drop state on restart.
@@ -171,7 +188,27 @@ gateway:
   # Example — bump log verbosity for one pod without touching the chart:
   #   - name: SIE_LOG_LEVEL
   #     value: "debug"
+  #
+  # Do not use extraEnv to set SIE_GATEWAY_HEALTH_MODE=nats unless you also run
+  # a worker-side publisher for sie.health.>. The chart intentionally does not
+  # expose gateway.healthMode until NATS worker health is wired end to end.
   extraEnv: []
+
+  # -- Liveness/readiness/startup probe timing. Mirrors config.probes; httpGet
+  # path/port are owned by the template. Defaults match the previous hardcoded
+  # values (modulo the dropped startupProbe.initialDelaySeconds).
+  probes:
+    startup:
+      periodSeconds: 5
+      failureThreshold: 12
+    liveness:
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    readiness:
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 3
 
   # -- Embedded configs: auto-generate ConfigMaps from files/ in chart and
   # mount them at /configs/{bundles,models} on the gateway. Disabled by
@@ -275,7 +312,9 @@ workers:
     # -- Cluster cache (S3/GCS) configuration
     clusterCache:
       enabled: false
-      # -- S3/GCS bucket URL (e.g., s3://my-bucket/models or gs://my-bucket/models)
+      # -- S3/GCS bucket URL with the /models prefix (e.g., s3://my-bucket/models or gs://my-bucket/models).
+      # AWS users: get this from `terraform output -raw model_cache_bucket_url`.
+      # Pre-populate the bucket once with `sie-admin cache weights sync --bundle default --dest <url>/`.
       url: ""
 
     # -- HuggingFace cache configuration
@@ -315,6 +354,31 @@ workers:
     #   - name: SIE_OOM_RECOVERY__RETRY_AFTER_S
     #     value: "5"
     extraEnv: []
+
+    # -- Liveness/readiness/startup probe timing for worker pods. The httpGet
+    # path/port are contracts owned by the template (workers expose /healthz
+    # and /readyz). Only the timing fields below are overridable.
+    #
+    # Defaults are tightened to reduce kubelet probe-poll latency on the
+    # cold-start path (issue #814):
+    #   - startupProbe.periodSeconds 10 → 3, failureThreshold 60 → 200
+    #     (preserves the ≥600s budget: 200 × 3s = 600s for model downloads
+    #     and GPU loading)
+    #   - readinessProbe.initialDelaySeconds dropped, periodSeconds 10 → 2
+    #     so kubelet flips the pod to Ready within ~2s of mark_ready()
+    probes:
+      startup:
+        periodSeconds: 3
+        failureThreshold: 200
+      liveness:
+        initialDelaySeconds: 10
+        periodSeconds: 30
+        timeoutSeconds: 10
+        failureThreshold: 3
+      readiness:
+        periodSeconds: 2
+        timeoutSeconds: 10
+        failureThreshold: 3
 
   # -- Worker pools (one StatefulSet per pool)
   # Each pool creates a WorkerGroup: one StatefulSet + one pre-pull DaemonSet.
@@ -479,7 +543,33 @@ ingress:
   # -- TLS configuration
   tls:
     enabled: false
+    # Mode: byo | cert-manager
+    #   byo:          user supplies a kubernetes.io/tls Secret named `secretName`. (default — backward compatible)
+    #   cert-manager: chart adds a cert-manager annotation to the main Ingress; cert-manager populates `secretName`.
+    #                 Requires cert-manager to be installed in the cluster (one-time prerequisite).
+    mode: byo
+    # Name of the kubernetes.io/tls Secret. In cert-manager mode this is where cert-manager writes the cert.
     secretName: sie-tls
+    # cert-manager-specific knobs (only used when mode=cert-manager)
+    certManager:
+      # Issuer kind: ClusterIssuer (cluster-scoped) | Issuer (namespace-scoped). Case-sensitive.
+      kind: ClusterIssuer
+      # When true, chart renders the Issuer/ClusterIssuer using settings below.
+      # When false, chart only annotates the Ingress, referencing an existing Issuer/ClusterIssuer by `name`.
+      create: true
+      # Name of the Issuer/ClusterIssuer. Empty string => default "{fullname}-letsencrypt-prod" (release-scoped,
+      # avoids collisions when two SIE releases share a cluster). Override to a static name only when there is
+      # known to be no other SIE release on this cluster.
+      name: ""
+      # ACME settings (used only when create=true). Flat (no nested `acme:` block) — ACME is the only supported issuer path.
+      server: https://acme-v02.api.letsencrypt.org/directory
+      # Email for ACME account registration. REQUIRED when create=true. Empty value triggers a helm install/upgrade fail.
+      email: ""
+      # Secret name where cert-manager stores the ACME account private key. Cluster-scoped if kind=ClusterIssuer.
+      privateKeySecretRef: letsencrypt-account-key
+      # HTTP-01 solver ingress class. Empty => defaults to .Values.ingress.className. Override only if your
+      # cert-manager solver needs a different class than your data-plane ingress (rare).
+      ingressClassName: ""
 
 # -- Auth configuration (ingress-nginx + oauth2-proxy)
 auth:

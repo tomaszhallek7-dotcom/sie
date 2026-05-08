@@ -7,11 +7,13 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
+use utoipa::ToSchema;
 
+use crate::http_error::{code as err_code, json_detail};
 use crate::server::AppState;
 use crate::state::pool_manager::DEFAULT_POOL_NAME;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreatePoolRequest {
     pub name: String,
     #[serde(default)]
@@ -24,6 +26,16 @@ pub struct CreatePoolRequest {
     pub minimum_worker_count: u32,
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/pools",
+    tag = "pools",
+    request_body = CreatePoolRequest,
+    responses(
+        (status = 201, description = "Pool created", body = crate::types::pool::Pool),
+        (status = 400, description = "Invalid pool request", body = crate::openapi::StandardApiError)
+    )
+)]
 pub async fn create_pool(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreatePoolRequest>,
@@ -31,7 +43,10 @@ pub async fn create_pool(
     if req.name.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"message": "Pool name is required"})),
+            Json(json_detail(
+                err_code::INVALID_REQUEST,
+                "Pool name is required",
+            )),
         )
             .into_response();
     }
@@ -39,7 +54,10 @@ pub async fn create_pool(
     if req.gpus.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"message": "GPU requirements are required"})),
+            Json(json_detail(
+                err_code::INVALID_REQUEST,
+                "GPU requirements are required",
+            )),
         )
             .into_response();
     }
@@ -61,17 +79,33 @@ pub async fn create_pool(
         }
         Err(e) => (
             StatusCode::BAD_REQUEST,
-            Json(json!({"message": e.to_string()})),
+            Json(json_detail(err_code::INVALID_REQUEST, e.to_string())),
         )
             .into_response(),
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/pools",
+    tag = "pools",
+    responses((status = 200, description = "Pools visible to this gateway replica", body = crate::openapi::PoolListResponse))
+)]
 pub async fn list_pools(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let pools = state.pool_manager.list_pools().await;
     (StatusCode::OK, Json(json!({"pools": pools})))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/pools/{name}",
+    tag = "pools",
+    params(("name" = String, Path, description = "Pool name")),
+    responses(
+        (status = 200, description = "Pool detail", body = crate::types::pool::Pool),
+        (status = 404, description = "Pool not found", body = crate::openapi::StandardApiError)
+    )
+)]
 pub async fn get_pool(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -80,12 +114,26 @@ pub async fn get_pool(
         Some(pool) => (StatusCode::OK, Json(json!(pool))).into_response(),
         None => (
             StatusCode::NOT_FOUND,
-            Json(json!({"message": format!("Pool '{}' not found", name)})),
+            Json(json_detail(
+                err_code::POOL_NOT_FOUND,
+                format!("Pool '{}' not found", name),
+            )),
         )
             .into_response(),
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/v1/pools/{name}",
+    tag = "pools",
+    params(("name" = String, Path, description = "Pool name")),
+    responses(
+        (status = 200, description = "Pool deleted", body = crate::openapi::MessageResponse),
+        (status = 403, description = "Pool cannot be deleted", body = crate::openapi::StandardApiError),
+        (status = 404, description = "Pool not found", body = crate::openapi::StandardApiError)
+    )
+)]
 pub async fn delete_pool(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -93,7 +141,10 @@ pub async fn delete_pool(
     if name == DEFAULT_POOL_NAME {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({"message": "Cannot delete the default pool"})),
+            Json(json_detail(
+                err_code::DEFAULT_POOL_DELETE_FORBIDDEN,
+                "Cannot delete the default pool",
+            )),
         )
             .into_response();
     }
@@ -105,17 +156,33 @@ pub async fn delete_pool(
         }
         Ok(false) => (
             StatusCode::NOT_FOUND,
-            Json(json!({"message": format!("Pool '{}' not found", name)})),
+            Json(json_detail(
+                err_code::POOL_NOT_FOUND,
+                format!("Pool '{}' not found", name),
+            )),
         )
             .into_response(),
         Err(e) => (
             StatusCode::FORBIDDEN,
-            Json(json!({"message": e.to_string()})),
+            Json(json_detail(
+                err_code::POOL_OPERATION_FORBIDDEN,
+                e.to_string(),
+            )),
         )
             .into_response(),
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/pools/{name}/renew",
+    tag = "pools",
+    params(("name" = String, Path, description = "Pool name")),
+    responses(
+        (status = 200, description = "Pool renewed", body = crate::openapi::MessageResponse),
+        (status = 404, description = "Pool not found", body = crate::openapi::StandardApiError)
+    )
+)]
 pub async fn renew_pool(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -126,7 +193,10 @@ pub async fn renew_pool(
     } else {
         (
             StatusCode::NOT_FOUND,
-            Json(json!({"message": format!("Pool '{}' not found", name)})),
+            Json(json_detail(
+                err_code::POOL_NOT_FOUND,
+                format!("Pool '{}' not found", name),
+            )),
         )
     }
 }

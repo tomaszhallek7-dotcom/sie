@@ -1,15 +1,18 @@
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use base64::Engine;
 use dashmap::DashMap;
+use percent_encoding::percent_decode_str;
 use rmp_serde;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+use crate::http_error::{code as err_code, json_detail, json_detail_merge};
 use crate::metrics;
 use crate::queue::publisher;
 
@@ -41,6 +44,10 @@ const RESOURCE_EXHAUSTED_RETRY_AFTER: &str = "5";
 const LORA_LOADING_ERROR_CODE: &str = "LORA_LOADING";
 const LORA_LOADING_RETRY_AFTER: &str = "5";
 const ESTIMATED_WAIT_S: u64 = 180;
+/// Terminal model load failure (non-retryable). Matches ``sie_server`` HTTP 502
+/// contract so ``sie_sdk`` can short-circuit before the ``MODEL_LOADING`` retry
+/// budget (see ``raise_if_model_load_failed``).
+const MODEL_LOAD_FAILED_ERROR_CODE: &str = "MODEL_LOAD_FAILED";
 
 /// Track which SDK minor versions we've already warned about (to warn once per minor).
 static SDK_WARNED_MINORS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
@@ -170,14 +177,92 @@ async fn resolve_effective_pool(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/encode/{model}",
+    tag = "inference",
+    description = "Mixed-success batches return 200 with only successful items; the response carries no per-item error envelope. For per-item error visibility, send single-item batches.",
+    params(
+        ("model" = String, Path, description = "Model id; percent-encode slashes when using OpenAPI-generated clients"),
+        ("X-SIE-MACHINE-PROFILE" = Option<String>, Header, description = "Preferred GPU or machine profile"),
+        ("X-SIE-Pool" = Option<String>, Header, description = "Explicit pool routing override"),
+        ("X-SIE-SDK-Version" = Option<String>, Header, description = "Client SDK version for skew warnings")
+    ),
+    request_body = crate::openapi::EncodeRequest,
+    responses(
+        (status = 200, description = "Encode response", body = crate::openapi::EncodeResponse),
+        (status = 202, description = "Worker provisioning in progress", body = crate::openapi::ProvisioningResponse),
+        (status = 400, description = "Invalid request", body = crate::openapi::StandardApiError),
+        (status = 401, description = "Missing or invalid bearer token", body = crate::openapi::StandardApiError),
+        (status = 404, description = "Model not found", body = crate::openapi::StandardApiError),
+        (status = 409, description = "Bundle override conflicts with model routing", body = crate::openapi::BundleConflictResponse),
+        (status = 413, description = "Request body too large", body = crate::openapi::StandardApiError),
+        (status = 500, description = "All batch items failed or gateway internal error", body = crate::openapi::InferenceInternalServerErrorResponse),
+        (status = 502, description = "Terminal model load failure (MODEL_LOAD_FAILED)", body = crate::openapi::GatewayModelLoadFailedResponse),
+        (status = 503, description = "Queue unavailable, GPU not configured, model loading, or capacity exhausted", body = crate::openapi::InferenceServiceUnavailableResponse),
+        (status = 504, description = "Result channel closed", body = crate::openapi::StandardApiError)
+    )
+)]
 pub async fn proxy_encode(state: State<Arc<AppState>>, req: Request) -> impl IntoResponse {
     proxy_request(state, req, "encode").await
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/score/{model}",
+    tag = "inference",
+    description = "Mixed-success batches return 200 with only successful items; the response carries no per-item error envelope. For per-item error visibility, send single-item batches.",
+    params(
+        ("model" = String, Path, description = "Model id; percent-encode slashes when using OpenAPI-generated clients"),
+        ("X-SIE-MACHINE-PROFILE" = Option<String>, Header, description = "Preferred GPU or machine profile"),
+        ("X-SIE-Pool" = Option<String>, Header, description = "Explicit pool routing override"),
+        ("X-SIE-SDK-Version" = Option<String>, Header, description = "Client SDK version for skew warnings")
+    ),
+    request_body = crate::openapi::ScoreRequest,
+    responses(
+        (status = 200, description = "Score response", body = crate::openapi::ScoreResponse),
+        (status = 202, description = "Worker provisioning in progress", body = crate::openapi::ProvisioningResponse),
+        (status = 400, description = "Invalid request", body = crate::openapi::StandardApiError),
+        (status = 401, description = "Missing or invalid bearer token", body = crate::openapi::StandardApiError),
+        (status = 404, description = "Model not found", body = crate::openapi::StandardApiError),
+        (status = 409, description = "Bundle override conflicts with model routing", body = crate::openapi::BundleConflictResponse),
+        (status = 413, description = "Request body too large", body = crate::openapi::StandardApiError),
+        (status = 500, description = "All batch items failed or gateway internal error", body = crate::openapi::InferenceInternalServerErrorResponse),
+        (status = 502, description = "Terminal model load failure (MODEL_LOAD_FAILED)", body = crate::openapi::GatewayModelLoadFailedResponse),
+        (status = 503, description = "Queue unavailable, GPU not configured, model loading, or capacity exhausted", body = crate::openapi::InferenceServiceUnavailableResponse),
+        (status = 504, description = "Result channel closed", body = crate::openapi::StandardApiError)
+    )
+)]
 pub async fn proxy_score(state: State<Arc<AppState>>, req: Request) -> impl IntoResponse {
     proxy_request(state, req, "score").await
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/extract/{model}",
+    tag = "inference",
+    description = "Mixed-success batches return 200 with only successful items; the response carries no per-item error envelope. For per-item error visibility, send single-item batches.",
+    params(
+        ("model" = String, Path, description = "Model id; percent-encode slashes when using OpenAPI-generated clients"),
+        ("X-SIE-MACHINE-PROFILE" = Option<String>, Header, description = "Preferred GPU or machine profile"),
+        ("X-SIE-Pool" = Option<String>, Header, description = "Explicit pool routing override"),
+        ("X-SIE-SDK-Version" = Option<String>, Header, description = "Client SDK version for skew warnings")
+    ),
+    request_body = crate::openapi::ExtractRequest,
+    responses(
+        (status = 200, description = "Extract response", body = crate::openapi::ExtractResponse),
+        (status = 202, description = "Worker provisioning in progress", body = crate::openapi::ProvisioningResponse),
+        (status = 400, description = "Invalid request", body = crate::openapi::StandardApiError),
+        (status = 401, description = "Missing or invalid bearer token", body = crate::openapi::StandardApiError),
+        (status = 404, description = "Model not found", body = crate::openapi::StandardApiError),
+        (status = 409, description = "Bundle override conflicts with model routing", body = crate::openapi::BundleConflictResponse),
+        (status = 413, description = "Request body too large", body = crate::openapi::StandardApiError),
+        (status = 500, description = "All batch items failed or gateway internal error", body = crate::openapi::InferenceInternalServerErrorResponse),
+        (status = 502, description = "Terminal model load failure (MODEL_LOAD_FAILED)", body = crate::openapi::GatewayModelLoadFailedResponse),
+        (status = 503, description = "Queue unavailable, GPU not configured, model loading, or capacity exhausted", body = crate::openapi::InferenceServiceUnavailableResponse),
+        (status = 504, description = "Result channel closed", body = crate::openapi::StandardApiError)
+    )
+)]
 pub async fn proxy_extract(state: State<Arc<AppState>>, req: Request) -> impl IntoResponse {
     proxy_request(state, req, "extract").await
 }
@@ -193,7 +278,17 @@ async fn proxy_request(
     // Extract model from path: /v1/{endpoint}/{model...}
     let prefix = format!("/v1/{}/", endpoint);
     let path = req.uri().path().to_string();
-    let model = path.strip_prefix(&prefix).unwrap_or("").to_string();
+    let raw_model = path.strip_prefix(&prefix).unwrap_or("");
+    let model = match decode_model_path(raw_model) {
+        Ok(model) => model,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_detail(err_code::INVALID_REQUEST, message)),
+            )
+                .into_response();
+        }
+    };
 
     if model.is_empty() {
         // Early exit, headers haven't been parsed yet — pass through
@@ -203,7 +298,7 @@ async fn proxy_request(
         metrics::record_rejected_request("", "unknown", "model_required");
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"message": "model is required"})),
+            Json(json_detail(err_code::INVALID_REQUEST, "model is required")),
         )
             .into_response();
     }
@@ -232,17 +327,23 @@ async fn proxy_request(
             Err(ResolveError::ModelNotFound(e)) => {
                 return (
                     StatusCode::NOT_FOUND,
-                    Json(json!({"message": e.to_string()})),
+                    Json(json_detail(err_code::MODEL_NOT_FOUND, e.to_string())),
                 )
                     .into_response();
             }
             Err(ResolveError::BundleConflict(e)) => {
+                let mut m = Map::new();
+                m.insert(
+                    "compatible_bundles".to_string(),
+                    json!(e.compatible_bundles),
+                );
                 return (
                     StatusCode::CONFLICT,
-                    Json(json!({
-                        "message": e.to_string(),
-                        "compatible_bundles": e.compatible_bundles,
-                    })),
+                    Json(json_detail_merge(
+                        err_code::BUNDLE_ROUTING_CONFLICT,
+                        e.to_string(),
+                        m,
+                    )),
                 )
                     .into_response();
             }
@@ -250,9 +351,10 @@ async fn proxy_request(
     } else if state.model_registry.has_any_models() {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({
-                "message": format!("Unknown model '{}'", model_name),
-            })),
+            Json(json_detail(
+                err_code::MODEL_NOT_FOUND,
+                format!("Model '{}' not found", model_name),
+            )),
         )
             .into_response();
     } else if bundle_override.is_empty() {
@@ -317,14 +419,19 @@ async fn proxy_request(
 
         if !found {
             metrics::record_rejected_request(&gpu, &bundle, "gpu_not_configured");
+            let mut m = Map::new();
+            m.insert("gpu".to_string(), json!(&gpu));
+            m.insert(
+                "configured_gpu_types".to_string(),
+                json!(&state.config.configured_gpus),
+            );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "status": "gpu_not_configured",
-                    "gpu": gpu,
-                    "configured_gpu_types": state.config.configured_gpus,
-                    "message": format!("GPU type '{}' is not configured in this cluster.", gpu),
-                })),
+                Json(json_detail_merge(
+                    err_code::GPU_NOT_CONFIGURED,
+                    format!("GPU type '{}' is not configured in this cluster.", gpu),
+                    m,
+                )),
             )
                 .into_response();
         }
@@ -334,9 +441,10 @@ async fn proxy_request(
         metrics::record_rejected_request(&gpu, &bundle, "queue_unavailable");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "message": "Rust gateway is queue-only, but NATS JetStream is unavailable"
-            })),
+            Json(json_detail(
+                err_code::QUEUE_UNAVAILABLE,
+                "Rust gateway is queue-only, but NATS JetStream is unavailable",
+            )),
         )
             .into_response();
     };
@@ -400,6 +508,14 @@ async fn proxy_request(
                 HeaderName::from_static("retry-after"),
                 HeaderValue::from_static(DEFAULT_RETRY_AFTER),
             );
+            resp.headers_mut().insert(
+                HeaderName::from_static("x-sie-version"),
+                HeaderValue::from_static(GATEWAY_VERSION),
+            );
+            resp.headers_mut().insert(
+                HeaderName::from_static("x-sie-server-version"),
+                HeaderValue::from_static(GATEWAY_VERSION),
+            );
             return resp;
         }
     };
@@ -434,7 +550,10 @@ async fn proxy_request(
             metrics::record_rejected_request(&gpu, &bundle, "body_too_large");
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
-                Json(json!({"message": format!("Request body too large (max {} bytes)", MAX_PROXY_BODY)})),
+                Json(json_detail(
+                    err_code::PAYLOAD_TOO_LARGE,
+                    format!("Request body too large (max {} bytes)", MAX_PROXY_BODY),
+                )),
             )
                 .into_response();
         }
@@ -491,7 +610,10 @@ async fn queue_mode_proxy(
             metrics::record_rejected_request(gpu, bundle, "body_parse_error");
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"message": format!("Failed to parse request body: {}", e)})),
+                Json(json_detail(
+                    err_code::INVALID_REQUEST,
+                    format!("Failed to parse request body: {}", e),
+                )),
             )
                 .into_response();
         }
@@ -501,7 +623,10 @@ async fn queue_mode_proxy(
         metrics::record_rejected_request(gpu, bundle, "empty_items");
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"message": "No items found in request body"})),
+            Json(json_detail(
+                err_code::INVALID_REQUEST,
+                "No items found in request body",
+            )),
         )
             .into_response();
     }
@@ -529,12 +654,19 @@ async fn queue_mode_proxy(
             let lower = e.to_lowercase();
             if lower.contains("score request missing query item") {
                 metrics::record_rejected_request(gpu, bundle, "score_missing_query");
-                return (StatusCode::BAD_REQUEST, Json(json!({"message": e}))).into_response();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json_detail(err_code::INVALID_REQUEST, e)),
+                )
+                    .into_response();
             }
 
             let mut response = (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"message": format!("Queue publish failed: {}", e)})),
+                Json(json_detail(
+                    err_code::QUEUE_UNAVAILABLE,
+                    format!("Queue publish failed: {}", e),
+                )),
             )
                 .into_response();
 
@@ -576,7 +708,10 @@ async fn queue_mode_proxy(
             metrics::record_rejected_request(gpu, bundle, "result_channel_closed");
             return (
                 StatusCode::GATEWAY_TIMEOUT,
-                Json(json!({"message": "Result channel closed"})),
+                Json(json_detail(
+                    err_code::GATEWAY_TIMEOUT,
+                    "Result channel closed",
+                )),
             )
                 .into_response();
         }
@@ -609,6 +744,17 @@ async fn queue_mode_proxy(
     let errors: Vec<&publisher::WorkResult> = results.iter().filter(|r| !r.success).collect();
 
     if successful.is_empty() && !errors.is_empty() {
+        if errors
+            .iter()
+            .all(|r| r.error_code.as_deref() == Some(MODEL_LOAD_FAILED_ERROR_CODE))
+        {
+            let first_msg = errors
+                .first()
+                .and_then(|r| r.error.as_deref())
+                .unwrap_or("Model load failed");
+            metrics::record_rejected_request(gpu, bundle, "model_load_failed_terminal");
+            return build_model_load_failed_response(model, first_msg);
+        }
         // Translate retryable worker error codes into the SDK-expected 503
         // contract. Without this every per-item failure surfaced as 500
         // ``all_items_failed`` and the SDK retry path never engaged. We
@@ -645,83 +791,9 @@ async fn queue_mode_proxy(
             .into_response();
     }
 
-    let content_key = if endpoint == "score" {
-        "scores"
-    } else {
-        "items"
-    };
     let status: u16 = 200;
 
-    let resp_body = if use_msgpack {
-        // Msgpack: build {"model": ..., "items"|"scores": [raw_blobs...]} at byte level
-        let result_blobs: Vec<&[u8]> = successful
-            .iter()
-            .map(|r| r.result_msgpack.as_slice())
-            .collect();
-        let mut packer = rmp::encode::buffer::ByteBuf::new();
-        let n_keys = if errors.is_empty() { 2u32 } else { 3 };
-        rmp::encode::write_map_len(&mut packer, n_keys).unwrap();
-        rmp::encode::write_str(&mut packer, "model").unwrap();
-        rmp::encode::write_str(&mut packer, model).unwrap();
-        rmp::encode::write_str(&mut packer, content_key).unwrap();
-        if endpoint == "score" && result_blobs.len() == 1 {
-            // Score: single blob is the complete list, embed directly
-            let mut parts = packer.into_vec();
-            parts.extend_from_slice(result_blobs[0]);
-            parts
-        } else {
-            rmp::encode::write_array_len(&mut packer, result_blobs.len() as u32).unwrap();
-            let mut parts = packer.into_vec();
-            for blob in result_blobs {
-                parts.extend_from_slice(blob);
-            }
-            parts
-        }
-    } else {
-        // JSON: decode each blob, convert numpy arrays, wrap in envelope.
-        //
-        // The result blobs typically carry msgpack_numpy-encoded
-        // arrays — `{"nd": true, "type": "<f4", "shape": [...],
-        // "data": <binary>}`. `rmpv_to_response_json` detects the
-        // sentinel while walking the `rmpv::Value` tree and decodes
-        // `Binary` / `Ext` blobs directly from their byte slice, so
-        // we never materialise the `data` buffer as a
-        // `Vec<serde_json::Value::Number>` (one Number per byte)
-        // just to re-collect it back into bytes for dtype decoding.
-        let mut result_items: Vec<serde_json::Value> = successful
-            .iter()
-            .filter_map(|r| {
-                let rmpv_val: rmpv::Value = rmp_serde::from_slice(&r.result_msgpack).ok()?;
-                Some(rmpv_to_response_json(rmpv_val))
-            })
-            .collect();
-        // Score: the single blob *is* the candidate-list already, so
-        // we unwrap it and hand the inner array straight to the
-        // envelope. Use `into_iter().next()` to move the item out
-        // instead of cloning — score payloads can be thousands of
-        // entries long and this used to clone the whole vec.
-        let items_val = if endpoint == "score" && result_items.len() == 1 {
-            match result_items.pop() {
-                Some(serde_json::Value::Array(arr)) => serde_json::Value::Array(arr),
-                Some(other) => serde_json::Value::Array(vec![other]),
-                None => serde_json::Value::Array(Vec::new()),
-            }
-        } else {
-            serde_json::Value::Array(result_items)
-        };
-        let mut response_data = json!({
-            "model": model,
-            content_key: items_val,
-        });
-        if !errors.is_empty() {
-            let error_details: Vec<serde_json::Value> = errors
-                .iter()
-                .map(|r| json!({"item_index": r.item_index, "error": r.error}))
-                .collect();
-            response_data["errors"] = json!(error_details);
-        }
-        serde_json::to_vec(&response_data).unwrap_or_default()
-    };
+    let resp_body = build_queue_success_body(endpoint, model, &successful, use_msgpack);
 
     debug!(
         request_id = %request_id,
@@ -794,6 +866,41 @@ async fn queue_mode_proxy(
             .insert(HeaderName::from_static("x-sie-worker"), val);
     }
     response
+}
+
+fn build_model_load_failed_response(model: &str, message: &str) -> Response {
+    let mut resp = (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({
+            "error": {
+                "code": MODEL_LOAD_FAILED_ERROR_CODE,
+                "message": format!(
+                    "Model '{model}' failed to load ({MODEL_LOAD_FAILED_ERROR_CODE}, attempts=1): {message}"
+                ),
+                "error_class": MODEL_LOAD_FAILED_ERROR_CODE,
+                "attempts": 1,
+                "permanent": true,
+            }
+        })),
+    )
+        .into_response();
+    resp.headers_mut().insert(
+        HeaderName::from_static("x-sie-error-code"),
+        HeaderValue::from_static(MODEL_LOAD_FAILED_ERROR_CODE),
+    );
+    resp.headers_mut().insert(
+        HeaderName::from_static("x-sie-error-version"),
+        HeaderValue::from_static(GATEWAY_VERSION),
+    );
+    resp.headers_mut().insert(
+        HeaderName::from_static("x-sie-version"),
+        HeaderValue::from_static(GATEWAY_VERSION),
+    );
+    resp.headers_mut().insert(
+        HeaderName::from_static("x-sie-server-version"),
+        HeaderValue::from_static(GATEWAY_VERSION),
+    );
+    resp
 }
 
 /// Return the retryable error code shared by every failed item, or
@@ -944,6 +1051,13 @@ fn parse_model_spec(spec: &str) -> (String, String) {
     }
 }
 
+fn decode_model_path(raw: &str) -> Result<String, String> {
+    percent_decode_str(raw)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .map_err(|_| "model path is not valid UTF-8 after percent decoding".to_string())
+}
+
 fn resolve_machine_profile(
     gpu: &str,
     gpu_profile_map: &std::collections::HashMap<String, String>,
@@ -1038,6 +1152,126 @@ fn insert_queue_worker_timing_headers(
         "x-payload-fetch-time",
         max_result_timing(successful, |result| result.payload_fetch_ms),
     );
+}
+
+fn is_openai_embeddings_forwarded_header(name: &str) -> bool {
+    [
+        "x-sie-request-id",
+        "x-sie-version",
+        "x-sie-server-version",
+        "x-sie-worker",
+        "x-queue-publish-time",
+        "x-queue-wait-time",
+        "x-queue-time",
+        "x-inference-time",
+        "x-tokenization-time",
+        "x-postprocessing-time",
+        "x-payload-fetch-time",
+    ]
+    .iter()
+    .any(|allowed| name.eq_ignore_ascii_case(allowed))
+}
+
+fn result_decode_error_value(r: &publisher::WorkResult, message: String) -> serde_json::Value {
+    json!({
+        "item_index": r.item_index,
+        "work_item_id": r.work_item_id,
+        "error": {
+            "code": "RESULT_DECODE_FAILED",
+            "message": message,
+        },
+    })
+}
+
+fn validated_msgpack_result_blob(r: &publisher::WorkResult) -> Vec<u8> {
+    match rmp_serde::from_slice::<rmpv::Value>(&r.result_msgpack) {
+        Ok(_) => r.result_msgpack.clone(),
+        Err(err) => {
+            let placeholder =
+                result_decode_error_value(r, format!("failed to decode result_msgpack: {err}"));
+            rmp_serde::to_vec(&placeholder).unwrap_or_else(|_| {
+                rmp_serde::to_vec(&json!({
+                    "item_index": r.item_index,
+                    "error": {
+                        "code": "RESULT_DECODE_FAILED",
+                        "message": "failed to encode result decode error",
+                    },
+                }))
+                .unwrap_or_default()
+            })
+        }
+    }
+}
+
+fn build_queue_success_body(
+    endpoint: &str,
+    model: &str,
+    successful: &[&publisher::WorkResult],
+    use_msgpack: bool,
+) -> Vec<u8> {
+    let content_key = if endpoint == "score" {
+        "scores"
+    } else {
+        "items"
+    };
+
+    if use_msgpack {
+        // Msgpack: build {"model": ..., "items"|"scores": [raw_blobs...]}
+        // at byte level. Partial per-item failures are deliberately omitted
+        // from 200 bodies to keep parity with the Python server envelope.
+        let result_blobs: Vec<Vec<u8>> = successful
+            .iter()
+            .map(|r| validated_msgpack_result_blob(r))
+            .collect();
+        let mut packer = rmp::encode::buffer::ByteBuf::new();
+        rmp::encode::write_map_len(&mut packer, 2).unwrap();
+        rmp::encode::write_str(&mut packer, "model").unwrap();
+        rmp::encode::write_str(&mut packer, model).unwrap();
+        rmp::encode::write_str(&mut packer, content_key).unwrap();
+        if endpoint == "score" && result_blobs.len() == 1 {
+            let mut parts = packer.into_vec();
+            parts.extend_from_slice(&result_blobs[0]);
+            parts
+        } else {
+            rmp::encode::write_array_len(&mut packer, result_blobs.len() as u32).unwrap();
+            let mut parts = packer.into_vec();
+            for blob in &result_blobs {
+                parts.extend_from_slice(blob);
+            }
+            parts
+        }
+    } else {
+        // JSON: decode each blob, convert numpy arrays, wrap in the server
+        // envelope. The result blobs typically carry msgpack_numpy-encoded
+        // arrays; `rmpv_to_response_json` decodes those without bouncing large
+        // binary buffers through serde_json byte arrays.
+        let mut result_items: Vec<serde_json::Value> = successful
+            .iter()
+            .map(
+                |r| match rmp_serde::from_slice::<rmpv::Value>(&r.result_msgpack) {
+                    Ok(rmpv_val) => rmpv_to_response_json(rmpv_val),
+                    Err(err) => result_decode_error_value(
+                        r,
+                        format!("failed to decode result_msgpack: {err}"),
+                    ),
+                },
+            )
+            .collect();
+        let items_val = if endpoint == "score" && result_items.len() == 1 {
+            match result_items.pop() {
+                Some(serde_json::Value::Array(arr)) => serde_json::Value::Array(arr),
+                Some(other) => serde_json::Value::Array(vec![other]),
+                None => serde_json::Value::Array(Vec::new()),
+            }
+        } else {
+            serde_json::Value::Array(result_items)
+        };
+        serde_json::to_vec(&json!({
+            "model": model,
+            content_key: items_val,
+        }))
+        .unwrap_or_default()
+    }
 }
 
 /// Check client SDK version skew.
@@ -1305,25 +1539,19 @@ fn work_params_from_json(parsed: &serde_json::Value, endpoint: &str) -> publishe
     }
 
     let nested_params = parsed.get("params");
-    let shared_field = |key: &str| {
-        nested_params
-            .and_then(|params| params.get(key))
-            .or_else(|| parsed.get(key))
-    };
-    let options = shared_field("options").cloned();
+    let field = |key: &str| nested_params.and_then(|params| params.get(key));
+    let options = field("options").cloned();
 
     publisher::WorkParams {
-        output_types: shared_field("output_types")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            }),
-        instruction: shared_field("instruction")
+        output_types: field("output_types").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        }),
+        instruction: field("instruction")
             .and_then(|v| v.as_str())
             .map(String::from),
-        is_query: shared_field("is_query")
+        is_query: field("is_query")
             .and_then(|v| v.as_bool())
             .or_else(|| {
                 options
@@ -1333,14 +1561,12 @@ fn work_params_from_json(parsed: &serde_json::Value, endpoint: &str) -> publishe
             })
             .unwrap_or(false),
         options,
-        labels: shared_field("labels")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            }),
-        output_schema: shared_field("output_schema").cloned(),
+        labels: field("labels").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        }),
+        output_schema: field("output_schema").cloned(),
         query_item: None,
     }
 }
@@ -1367,21 +1593,16 @@ fn work_params_from_rmpv(
         };
     }
 
-    // For `encode`/`extract`, callers may nest the param block under
-    // `"params"`; fall through to the top-level if the nested copy
-    // doesn't carry the field.
+    // For `encode`/`extract`, match ``sie_server`` / msgspec: tuning fields live
+    // only under the ``params`` object (no top-level merge).
     let nested = rmpv_map_get(parsed, "params").and_then(|v| match v {
         rmpv::Value::Map(m) => Some(m.as_slice()),
         _ => None,
     });
-    let shared_field = |key: &str| -> Option<&rmpv::Value> {
-        nested
-            .and_then(|m| rmpv_map_get(m, key))
-            .or_else(|| rmpv_map_get(parsed, key))
-    };
-    let options_rmpv = shared_field("options");
+    let field = |key: &str| -> Option<&rmpv::Value> { nested.and_then(|m| rmpv_map_get(m, key)) };
+    let options_rmpv = field("options");
     let options = options_rmpv.map(rmpv_to_json_owned);
-    let is_query = shared_field("is_query")
+    let is_query = field("is_query")
         .and_then(rmpv_as_bool)
         .or_else(|| {
             options_rmpv
@@ -1394,14 +1615,12 @@ fn work_params_from_rmpv(
         .unwrap_or(false);
 
     publisher::WorkParams {
-        output_types: shared_field("output_types").and_then(rmpv_string_array),
-        instruction: shared_field("instruction")
-            .and_then(rmpv_as_str)
-            .map(String::from),
+        output_types: field("output_types").and_then(rmpv_string_array),
+        instruction: field("instruction").and_then(rmpv_as_str).map(String::from),
         is_query,
         options,
-        labels: shared_field("labels").and_then(rmpv_string_array),
-        output_schema: shared_field("output_schema").map(rmpv_to_json_owned),
+        labels: field("labels").and_then(rmpv_string_array),
+        output_schema: field("output_schema").map(rmpv_to_json_owned),
         query_item: None,
     }
 }
@@ -1826,6 +2045,339 @@ fn reshape_recursive(
     (serde_json::Value::Array(result), offset)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct OpenAiEmbeddingInput {
+    texts: Vec<String>,
+    token_count: u64,
+}
+
+fn estimate_embedding_tokens(texts: &[String]) -> u64 {
+    let total: usize = texts.iter().map(|s| s.len()).sum();
+    u64::max(1, (total / 4) as u64)
+}
+
+fn openai_embedding_input_to_texts(input: &Value) -> Result<OpenAiEmbeddingInput, String> {
+    match input {
+        Value::String(s) => {
+            let texts = vec![s.clone()];
+            Ok(OpenAiEmbeddingInput {
+                token_count: estimate_embedding_tokens(&texts),
+                texts,
+            })
+        }
+        Value::Array(a) if a.is_empty() => Err("input array is empty".to_string()),
+        Value::Array(a) if a.iter().all(|x| x.is_string()) => {
+            let texts: Vec<String> = a
+                .iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect();
+            Ok(OpenAiEmbeddingInput {
+                token_count: estimate_embedding_tokens(&texts),
+                texts,
+            })
+        }
+        Value::Array(a)
+            if a.iter().all(|x| x.as_i64().is_some())
+                || a.iter().all(|x| {
+                    x.as_array()
+                        .map(|arr| arr.iter().all(|inner| inner.as_i64().is_some()))
+                        .unwrap_or(false)
+                }) =>
+        {
+            Err(
+                "token-array embeddings input is not supported by the gateway; use text input"
+                    .to_string(),
+            )
+        }
+        _ => Err("input must be a string or array of strings".to_string()),
+    }
+}
+
+fn extract_dense_embedding_vector(item: &Value) -> Option<Vec<f64>> {
+    let dense = item.get("dense")?;
+    if let Some(arr) = dense.as_array() {
+        return arr.iter().map(Value::as_f64).collect();
+    }
+    dense
+        .get("values")
+        .and_then(|v| v.as_array())
+        .and_then(|vals| vals.iter().map(Value::as_f64).collect())
+}
+
+fn openai_embedding_value(vector: Vec<f64>, encoding_format: &str) -> Value {
+    if encoding_format == "base64" {
+        let mut bytes = Vec::with_capacity(vector.len() * std::mem::size_of::<f32>());
+        for value in vector {
+            bytes.extend_from_slice(&(value as f32).to_le_bytes());
+        }
+        Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
+    } else {
+        json!(vector)
+    }
+}
+
+fn openai_embedding_items_to_data(
+    items: &[Value],
+    expected_len: usize,
+    encoding_format: &str,
+) -> Result<Vec<Value>, String> {
+    if items.len() != expected_len {
+        return Err(format!(
+            "encode response item count mismatch: expected {}, got {}",
+            expected_len,
+            items.len()
+        ));
+    }
+
+    let mut data = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let Some(vec) = extract_dense_embedding_vector(item) else {
+            return Err(format!("item {idx} missing dense embedding"));
+        };
+        data.push(json!({
+            "object": "embedding",
+            "embedding": openai_embedding_value(vec, encoding_format),
+            "index": idx,
+        }));
+    }
+    Ok(data)
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/embeddings",
+    tag = "inference",
+    description = "OpenAI-compatible embeddings proxy. A 200 response contains one embedding per input; partial or truncated internal encode success is treated as a 500 INTERNAL_ERROR instead of returning a partial 200.",
+    request_body = crate::openapi::OpenAIEmbeddingRequest,
+    params(
+        ("X-SIE-MACHINE-PROFILE" = Option<String>, Header, description = "Preferred GPU or machine profile"),
+        ("X-SIE-Pool" = Option<String>, Header, description = "Explicit pool routing override"),
+        ("X-SIE-SDK-Version" = Option<String>, Header, description = "Client SDK version for skew warnings")
+    ),
+    responses(
+        (status = 200, description = "OpenAI-compatible embeddings response", body = crate::openapi::OpenAIEmbeddingsListResponse),
+        (status = 202, description = "Worker provisioning in progress", body = crate::openapi::ProvisioningResponse),
+        (status = 400, description = "Invalid request", body = crate::openapi::StandardApiError),
+        (status = 401, description = "Missing or invalid bearer token", body = crate::openapi::StandardApiError),
+        (status = 404, description = "Model not found", body = crate::openapi::StandardApiError),
+        (status = 409, description = "Bundle override conflicts with model routing", body = crate::openapi::BundleConflictResponse),
+        (status = 413, description = "Request body too large", body = crate::openapi::StandardApiError),
+        (status = 500, description = "All batch items failed or gateway internal error", body = crate::openapi::InferenceInternalServerErrorResponse),
+        (status = 502, description = "MODEL_LOAD_FAILED", body = crate::openapi::GatewayModelLoadFailedResponse),
+        (status = 503, description = "Model loading, capacity, queue unavailable, or GPU not configured", body = crate::openapi::InferenceServiceUnavailableResponse),
+        (status = 504, description = "Result channel closed", body = crate::openapi::StandardApiError)
+    )
+)]
+pub async fn proxy_openai_embeddings(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    check_sdk_version(req.headers());
+    const MAX: usize = 256 * 1024 * 1024;
+    let hdr = req.headers().clone();
+    let (parts, body) = req.into_parts();
+    let body_bytes = match to_bytes(body, MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json_detail(
+                    err_code::PAYLOAD_TOO_LARGE,
+                    format!("request body: {}", e),
+                )),
+            )
+                .into_response();
+        }
+    };
+    let parsed: Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_detail(
+                    err_code::INVALID_REQUEST,
+                    format!("invalid JSON: {}", e),
+                )),
+            )
+                .into_response();
+        }
+    };
+    let model_str = match parsed.get("model").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_detail(
+                    err_code::INVALID_REQUEST,
+                    "field \"model\" is required",
+                )),
+            )
+                .into_response();
+        }
+    };
+    let enc_fmt = parsed
+        .get("encoding_format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("float");
+    if enc_fmt != "float" && enc_fmt != "base64" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_detail(
+                err_code::INVALID_REQUEST,
+                "encoding_format must be either 'float' or 'base64'",
+            )),
+        )
+            .into_response();
+    }
+    let input = parsed.get("input").cloned().unwrap_or(Value::Null);
+    let normalized_input = match openai_embedding_input_to_texts(&input) {
+        Ok(input) => input,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_detail(err_code::INVALID_REQUEST, msg)),
+            )
+                .into_response();
+        }
+    };
+    let OpenAiEmbeddingInput { texts, token_count } = normalized_input;
+    let encode_body = json!({
+        "items": texts.iter().map(|t| json!({"text": t})).collect::<Vec<_>>(),
+        "params": {"output_types": ["dense"]},
+    });
+    let encode_uri = format!("/v1/encode/{}", model_str.trim_start_matches('/'));
+    let encode_bytes = match serde_json::to_vec(&encode_body) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_detail(
+                    err_code::INTERNAL_ERROR,
+                    format!("encode body: {}", e),
+                )),
+            )
+                .into_response();
+        }
+    };
+    let version = parts.version;
+    let extensions = parts.extensions;
+    let mut inner_headers = HeaderMap::new();
+    for (name, val) in hdr.iter() {
+        let n = name.as_str();
+        if n.eq_ignore_ascii_case("authorization")
+            || n.eq_ignore_ascii_case("x-sie-machine-profile")
+            || n.eq_ignore_ascii_case("x-sie-pool")
+            || n.eq_ignore_ascii_case("x-sie-sdk-version")
+        {
+            inner_headers.insert(name.clone(), val.clone());
+        }
+    }
+    inner_headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    inner_headers.insert(
+        axum::http::header::ACCEPT,
+        HeaderValue::from_static("application/json"),
+    );
+    let uri: axum::http::Uri = match encode_uri.parse() {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_detail(
+                    err_code::INVALID_REQUEST,
+                    "invalid model id for path",
+                )),
+            )
+                .into_response();
+        }
+    };
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .version(version);
+    for (k, v) in inner_headers.iter() {
+        builder = builder.header(k, v);
+    }
+    let mut inner_req = match builder.body(Body::from(encode_bytes)) {
+        Ok(r) => r,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_detail(
+                    err_code::INTERNAL_ERROR,
+                    "failed to build internal encode request",
+                )),
+            )
+                .into_response();
+        }
+    };
+    *inner_req.extensions_mut() = extensions;
+    let resp = proxy_request(State(state.clone()), inner_req, "encode").await;
+    if resp.status() != StatusCode::OK {
+        return resp;
+    }
+    let enc_headers = resp.headers().clone();
+    let rb = match to_bytes(resp.into_body(), MAX).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_detail(
+                    err_code::INTERNAL_ERROR,
+                    "failed to read encode response body",
+                )),
+            )
+                .into_response();
+        }
+    };
+    let enc: Value = match serde_json::from_slice(&rb) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_detail(
+                    err_code::INTERNAL_ERROR,
+                    format!("encode JSON: {}", e),
+                )),
+            )
+                .into_response();
+        }
+    };
+    let Some(items) = enc.get("items").and_then(|i| i.as_array()) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_detail(
+                err_code::INTERNAL_ERROR,
+                "encode response missing items",
+            )),
+        )
+            .into_response();
+    };
+    let data = match openai_embedding_items_to_data(items, texts.len(), enc_fmt) {
+        Ok(data) => data,
+        Err(msg) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_detail(err_code::INTERNAL_ERROR, msg)),
+            )
+                .into_response();
+        }
+    };
+    let token_est = token_count;
+    let out = json!({
+        "object": "list",
+        "data": data,
+        "model": model_str,
+        "usage": {"prompt_tokens": token_est, "total_tokens": token_est},
+    });
+    let mut out_resp = (StatusCode::OK, Json(out)).into_response();
+    for (k, v) in enc_headers.iter() {
+        if is_openai_embeddings_forwarded_header(k.as_str()) {
+            out_resp.headers_mut().insert(k.clone(), v.clone());
+        }
+    }
+    out_resp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1837,6 +2389,18 @@ mod tests {
         let (bundle, model) = parse_model_spec("BAAI/bge-m3");
         assert_eq!(bundle, "");
         assert_eq!(model, "BAAI/bge-m3");
+    }
+
+    #[test]
+    fn test_decode_model_path_decodes_percent_encoded_slashes() {
+        let model = decode_model_path("premium:%2FBAAI%2Fbge-m3").unwrap();
+        assert_eq!(model, "premium:/BAAI/bge-m3");
+    }
+
+    #[test]
+    fn test_decode_model_path_rejects_invalid_utf8() {
+        let err = decode_model_path("BAAI%2Fbad%FFmodel").unwrap_err();
+        assert!(err.contains("not valid UTF-8"));
     }
 
     // ── build_model_loading_timeout_response ──────────────────────
@@ -1905,6 +2469,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_build_model_load_failed_response_uses_legacy_error_envelope_and_headers() {
+        let resp = build_model_load_failed_response("BAAI/bge-m3", "repository is gated");
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            resp.headers().get("x-sie-error-code").unwrap(),
+            MODEL_LOAD_FAILED_ERROR_CODE
+        );
+        assert!(resp.headers().get("x-sie-error-version").is_some());
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("response body is valid JSON");
+        assert_eq!(body["error"]["code"], MODEL_LOAD_FAILED_ERROR_CODE);
+        assert!(body.get("detail").is_none());
+    }
+
     // ── retryable error code translation ───────────────────────────
     //
     // When every item in a batch fails with the *same* retryable code
@@ -1923,6 +2506,25 @@ mod tests {
             result_msgpack: Vec::new(),
             error: Some(msg.to_string()),
             error_code: code.map(str::to_string),
+            inference_ms: None,
+            queue_ms: None,
+            processing_ms: None,
+            worker_id: None,
+            tokenization_ms: None,
+            postprocessing_ms: None,
+            payload_fetch_ms: None,
+        }
+    }
+
+    fn _ok_result(item_index: u32, result_msgpack: Vec<u8>) -> publisher::WorkResult {
+        publisher::WorkResult {
+            work_item_id: format!("req.{item_index}"),
+            request_id: "req".to_string(),
+            item_index,
+            success: true,
+            result_msgpack,
+            error: None,
+            error_code: None,
             inference_ms: None,
             queue_ms: None,
             processing_ms: None,
@@ -2015,6 +2617,153 @@ mod tests {
         let r1 = _err_result(None, "no code");
         let errors: Vec<&publisher::WorkResult> = vec![&r1];
         assert_eq!(unanimous_retryable_error_code(&errors), None);
+    }
+
+    #[test]
+    fn test_queue_success_body_json_omits_partial_error_envelope() {
+        let payload = rmp_serde::to_vec(&json!({"result": "ok"})).unwrap();
+        let ok = _ok_result(0, payload);
+        let body = build_queue_success_body("encode", "model-a", &[&ok], false);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(parsed["model"], "model-a");
+        assert_eq!(parsed["items"][0]["result"], "ok");
+        assert!(parsed.get("errors").is_none());
+    }
+
+    #[test]
+    fn test_queue_success_body_json_preserves_decode_failure_item() {
+        let bad = _ok_result(0, vec![0xc1]);
+        let body = build_queue_success_body("encode", "model-a", &[&bad], false);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(parsed["model"], "model-a");
+        let items = parsed["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["item_index"], 0);
+        assert_eq!(items[0]["work_item_id"], "req.0");
+        assert_eq!(items[0]["error"]["code"], "RESULT_DECODE_FAILED");
+        assert!(items[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("failed to decode result_msgpack"));
+    }
+
+    #[test]
+    fn test_queue_success_body_msgpack_has_server_envelope_only() {
+        let payload = rmp_serde::to_vec(&json!({"result": "ok"})).unwrap();
+        let ok = _ok_result(0, payload);
+        let body = build_queue_success_body("encode", "model-a", &[&ok], true);
+        let parsed: serde_json::Value = rmp_serde::from_slice(&body).unwrap();
+
+        assert_eq!(parsed["model"], "model-a");
+        assert_eq!(parsed["items"][0]["result"], "ok");
+        assert_eq!(parsed.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_queue_success_body_msgpack_preserves_decode_failure_item() {
+        let bad = _ok_result(0, vec![0xc1]);
+        let body = build_queue_success_body("encode", "model-a", &[&bad], true);
+        let parsed: serde_json::Value = rmp_serde::from_slice(&body).unwrap();
+
+        assert_eq!(parsed["model"], "model-a");
+        let items = parsed["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["item_index"], 0);
+        assert_eq!(items[0]["work_item_id"], "req.0");
+        assert_eq!(items[0]["error"]["code"], "RESULT_DECODE_FAILED");
+    }
+
+    #[test]
+    fn test_queue_success_body_score_msgpack_replaces_bad_single_payload() {
+        let bad = _ok_result(0, vec![0xc1]);
+        let body = build_queue_success_body("score", "model-a", &[&bad], true);
+        let parsed: serde_json::Value = rmp_serde::from_slice(&body).unwrap();
+
+        assert_eq!(parsed["model"], "model-a");
+        assert_eq!(parsed["scores"]["item_index"], 0);
+        assert_eq!(parsed["scores"]["error"]["code"], "RESULT_DECODE_FAILED");
+    }
+
+    #[test]
+    fn test_openai_embeddings_reject_token_id_array() {
+        let err = openai_embedding_input_to_texts(&json!([10, 20, 30])).unwrap_err();
+
+        assert!(err.contains("token-array embeddings input is not supported"));
+    }
+
+    #[test]
+    fn test_openai_embeddings_reject_nested_token_arrays() {
+        let err = openai_embedding_input_to_texts(&json!([[10, 20, 30], [40, 50]])).unwrap_err();
+
+        assert!(err.contains("token-array embeddings input is not supported"));
+    }
+
+    #[test]
+    fn test_openai_embeddings_forwarded_headers_include_encode_timings() {
+        for name in [
+            "x-sie-request-id",
+            "x-sie-version",
+            "x-sie-server-version",
+            "x-sie-worker",
+            "x-queue-publish-time",
+            "x-queue-wait-time",
+            "x-queue-time",
+            "x-inference-time",
+            "x-tokenization-time",
+            "x-postprocessing-time",
+            "x-payload-fetch-time",
+        ] {
+            assert!(
+                is_openai_embeddings_forwarded_header(name),
+                "{name} should be forwarded from /v1/encode to /v1/embeddings"
+            );
+        }
+        assert!(is_openai_embeddings_forwarded_header("X-SIE-WORKER"));
+        assert!(!is_openai_embeddings_forwarded_header("content-type"));
+        assert!(!is_openai_embeddings_forwarded_header("x-sie-error-code"));
+    }
+
+    #[test]
+    fn test_openai_embedding_value_base64_is_little_endian_f32() {
+        let encoded = openai_embedding_value(vec![1.0, -2.0], "base64");
+        let Value::String(encoded) = encoded else {
+            panic!("expected base64 string");
+        };
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(bytes, vec![0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0xc0]);
+    }
+
+    #[test]
+    fn test_openai_embedding_items_to_data_rejects_partial_encode_response() {
+        let items = vec![json!({"dense": [1.0, 2.0]})];
+        let err = openai_embedding_items_to_data(&items, 2, "float").unwrap_err();
+        assert!(err.contains("expected 2, got 1"));
+    }
+
+    #[test]
+    fn test_openai_embedding_items_to_data_rejects_missing_dense_vector() {
+        let items = vec![json!({"sparse": {"indices": [1], "values": [0.5]}})];
+        let err = openai_embedding_items_to_data(&items, 1, "float").unwrap_err();
+        assert_eq!(err, "item 0 missing dense embedding");
+    }
+
+    #[test]
+    fn test_openai_embedding_items_to_data_rejects_non_numeric_dense_array() {
+        let items = vec![json!({"dense": [1.0, "bad", 3.0]})];
+        let err = openai_embedding_items_to_data(&items, 1, "float").unwrap_err();
+        assert_eq!(err, "item 0 missing dense embedding");
+    }
+
+    #[test]
+    fn test_openai_embedding_items_to_data_rejects_non_numeric_dense_values() {
+        let items = vec![json!({"dense": {"values": [1.0, false, 3.0]}})];
+        let err = openai_embedding_items_to_data(&items, 1, "float").unwrap_err();
+        assert_eq!(err, "item 0 missing dense embedding");
     }
 
     #[test]
@@ -2240,10 +2989,8 @@ mod tests {
         assert_eq!(params.query_item, Some(rmpv::Value::from("hello")));
     }
 
-    /// Msgpack-in encode request: the whole body is a msgpack map,
-    /// `items` is an array of maps, and `work_params_from_rmpv`
-    /// should read `output_types` / `instruction` / `options` the
-    /// same way the JSON path does.
+    /// Msgpack-in encode request: tuning fields are read only from the nested
+    /// ``params`` map (parity with ``sie_server`` / msgspec).
     #[test]
     fn test_parse_queue_request_msgpack_encode_reads_params() {
         let body_value = rmpv::Value::Map(vec![
@@ -2255,19 +3002,24 @@ mod tests {
                 )])]),
             ),
             (
-                rmpv::Value::from("output_types"),
-                rmpv::Value::Array(vec![rmpv::Value::from("dense")]),
-            ),
-            (
-                rmpv::Value::from("instruction"),
-                rmpv::Value::from("search"),
-            ),
-            (
-                rmpv::Value::from("options"),
-                rmpv::Value::Map(vec![(
-                    rmpv::Value::from("is_query"),
-                    rmpv::Value::Boolean(true),
-                )]),
+                rmpv::Value::from("params"),
+                rmpv::Value::Map(vec![
+                    (
+                        rmpv::Value::from("output_types"),
+                        rmpv::Value::Array(vec![rmpv::Value::from("dense")]),
+                    ),
+                    (
+                        rmpv::Value::from("instruction"),
+                        rmpv::Value::from("search"),
+                    ),
+                    (
+                        rmpv::Value::from("options"),
+                        rmpv::Value::Map(vec![(
+                            rmpv::Value::from("is_query"),
+                            rmpv::Value::Boolean(true),
+                        )]),
+                    ),
+                ]),
             ),
         ]);
         let body = rmp_serde::to_vec(&body_value).unwrap();
@@ -2613,7 +3365,7 @@ mod tests {
         ];
         let items: Vec<serde_json::Value> = results
             .iter()
-            .filter_map(|r| rmp_serde::from_slice(&r.result_msgpack).ok())
+            .map(|r| rmp_serde::from_slice(&r.result_msgpack).unwrap())
             .collect();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["result"], "a");

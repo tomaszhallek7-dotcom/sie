@@ -1,6 +1,6 @@
 [project]
 name = "sie-server"
-version = "0.3.1"
+version = "0.3.2"
 description = "Search Inference Engine - GPU inference server for search workloads"
 requires-python = ">=3.12,<3.13"
 license = { text = "Apache-2.0" }
@@ -79,6 +79,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sie_server"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"models" = "sie_server/models"
+"bundles" = "sie_server/bundles"
 
 [tool.uv.sources]
 # Prebuilt flash-attn wheel for torch 2.9 + cu128 (official wheels only go up to torch 2.8)

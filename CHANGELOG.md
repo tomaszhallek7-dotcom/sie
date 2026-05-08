@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.3.2
+
+- chore(main): release 0.3.2
+- test(fixtures): configure deployment environment for test containers and clusters
+- ci(telemetry): add deployment environment tagging across internal infrastructure
+- docs(gateway): document embeddings partial-success contract
+- fix(docker): stub bundles/ and models/ in deps stage
+- docs(gateway): clarify OpenAPI contracts
+- fix(sie-server): include model and bundle directories in wheel distribution
+- feat(sie_server): per-stage timing markers in lifespan for engine_boot attribution
+- feat(sie_server): split adapter.warmup() out of load() with cold-start log markers
+- feat(helm): wire probe templates to values trees
+- feat(helm): expose probes value trees for worker/gateway/config
+- fix(gateway): preserve scale-from-zero request path
+- fix(gateway): preserve embeddings timing headers
+- fix(gateway): address latest coderabbit contract notes
+- docs(gateway): document service unavailable variants
+- fix(gateway): close remaining review contract gaps
+- docs(gateway): align embeddings encoding docs
+- fix(gateway): reject unsupported embeddings token arrays
+- fix(paddleocr_vl): pass use_cache=True to generate to enable KV-cache
+- fix(gateway): address probe and SDK review findings
+- feat(gateway): unify API errors and align probe contracts
+- fix(docling): mark adapter unloaded in unload()
+- fix(docling): cache DocumentConverter per (device, ocr_enabled)
+- fix(chart): pass --cluster-cache to sie-server and correct populate command in docs
+- docs(infra): drop mise wrappers from public-facing model-cache docs (#791)
+- feat(infra): opt-in S3 cluster model cache (#791)
+- docs(helm): correct Let's Encrypt rate-limit wording in README
+- fix(helm): validate ACME server and privateKeySecretRef in validateTls
+- docs(helm): address local reviewer suggestions on TLS work
+- feat(helm): TLS termination via cert-manager + BYO matrix docs
+- fix(gateway): address PR review for NATS health mode
+- fix(gateway): align CreatePoolRequest OpenAPI with runtime validation
+- fix(gateway): clarify experimental NATS health mode
+- feat(gateway): expose OpenAPI contract
+- feat(docling): add ocr profile defaulting do_ocr=true
+- fix(docling): thread device through PdfPipelineOptions accelerator_options
+- fix(review): tighten score_pairs options handling and query text validation
+- refactor(eval): consolidate colbert model lists and improve query validation
+- feat(adapters): default score_pairs() in BaseAdapter + baseline reranking targets
+- refactor(colbert): hoist score-pair grouping helper to _utils
+- feat(server): emit INFO log on invalid SIE_TORCH_NUM_THREADS fallback
+- feat(server): cap torch CPU threads at worker startup
+
 ## v0.3.1
 
 - chore(main): release 0.3.1
