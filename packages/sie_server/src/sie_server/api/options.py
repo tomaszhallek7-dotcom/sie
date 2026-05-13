@@ -3,6 +3,7 @@ from typing import Any
 from fastapi import HTTPException, status
 
 from sie_server.config.model import ModelConfig
+from sie_server.types.overflow_policy import VALID_OVERFLOW_POLICIES
 from sie_server.types.responses import ErrorCode
 
 
@@ -48,4 +49,18 @@ def resolve_runtime_options(
     # Merge request-level overrides (excluding the "profile" key itself)
     if request_options:
         merged |= {k: v for k, v in request_options.items() if k != "profile"}
+
+    overflow_policy = merged.get("overflow_policy")
+    if overflow_policy is not None and overflow_policy not in VALID_OVERFLOW_POLICIES:
+        span.set_attribute("error", "invalid_overflow_policy")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": ErrorCode.INVALID_INPUT.value,
+                "message": (
+                    f"Invalid overflow_policy: {overflow_policy!r}. Must be one of {sorted(VALID_OVERFLOW_POLICIES)}."
+                ),
+            },
+        )
+
     return merged

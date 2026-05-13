@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -11,11 +13,16 @@ from typing import TYPE_CHECKING, Any
 from sie_server.adapters.base import ModelAdapter
 from sie_server.config.model import ModelConfig, ProfileAdaptiveBatching
 from sie_server.core.inference import AttentionBackend, ComputePrecision
+from sie_server.core.load_errors import ModelLoadTimeoutError
 from sie_server.core.loader import load_adapter
 from sie_server.core.oom import OomRecoveryConfig
 from sie_server.core.worker import ModelWorker, WorkerConfig
 from sie_server.core.worker.types import AdaptiveBatchingParams
-from sie_server.observability.metrics import set_model_loaded, set_model_memory
+from sie_server.observability.metrics import (
+    increment_model_load_timeout,
+    set_model_loaded,
+    set_model_memory,
+)
 
 if TYPE_CHECKING:
     from sie_server.core.disk_cache import ModelDiskCacheManager
@@ -27,6 +34,42 @@ logger = logging.getLogger(__name__)
 
 # Default maximum LoRAs per model before LRU eviction
 DEFAULT_MAX_LORAS = 10
+
+# Default total-time budget (seconds) for the post-download portion of a
+# model load: adapter instantiation + ``adapter.load(device)`` + warmup.
+# The download phase is intentionally NOT bounded by this budget — it is
+# bounded only by ``HF_HUB_DOWNLOAD_TIMEOUT`` socket-inactivity stalls so
+# users on slow links can still complete legitimate multi-hour downloads.
+#
+# Override via the ``SIE_MODEL_LOAD_TIMEOUT_S`` env var or the
+# ``model_load_timeout_s`` constructor kwarg. ``0`` or a negative value
+# disables the timeout entirely.
+DEFAULT_MODEL_LOAD_TIMEOUT_S = 600.0
+_TIMEOUT_ENV_VAR = "SIE_MODEL_LOAD_TIMEOUT_S"
+
+
+def _resolve_load_timeout(explicit: float | None) -> float:
+    """Resolve effective post-download timeout in seconds.
+
+    Precedence: explicit kwarg > env var > built-in default. Returns ``0.0``
+    when disabled (``0`` or negative); callers treat that as "no
+    ``wait_for`` wrapping".
+    """
+    if explicit is not None:
+        return max(0.0, float(explicit))
+    raw = os.environ.get(_TIMEOUT_ENV_VAR)
+    if raw is None:
+        return DEFAULT_MODEL_LOAD_TIMEOUT_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r, falling back to default %ss",
+            _TIMEOUT_ENV_VAR,
+            raw,
+            DEFAULT_MODEL_LOAD_TIMEOUT_S,
+        )
+        return DEFAULT_MODEL_LOAD_TIMEOUT_S
 
 
 @dataclass
@@ -102,6 +145,7 @@ class ModelLoader:
         adaptive_batching: AdaptiveBatchingParams | None = None,
         oom_recovery: OomRecoveryConfig | None = None,
         registry_callbacks: RegistryCallbacks | None = None,
+        model_load_timeout_s: float | None = None,
     ) -> None:
         """Initialize the model loader.
 
@@ -128,6 +172,10 @@ class ModelLoader:
         self._oom_recovery = oom_recovery or OomRecoveryConfig()
         self._registry_callbacks = registry_callbacks
         self._load_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-load")
+        # Post-download budget (instantiate + adapter.load + warmup). 0.0
+        # disables the outer ``wait_for``. Download is bounded separately
+        # by ``HF_HUB_DOWNLOAD_TIMEOUT``.
+        self._model_load_timeout_s = _resolve_load_timeout(model_load_timeout_s)
 
     def update_configs(self, configs: dict[str, ModelConfig]) -> None:
         """Update the config reference (called after rescan)."""
@@ -145,9 +193,14 @@ class ModelLoader:
         This is separated from loading so we can check requires_main_thread
         before deciding how to run the load.
 
-        Also ensures model weights are in local cache (from cluster cache if needed).
+        IMPORTANT: As of the post-download-timeout refactor, this method
+        no longer ensures weights are cached — callers must invoke
+        :meth:`ensure_weights_cached` (or :meth:`ensure_weights_cached_async`)
+        first. The split exists so the download phase runs without an
+        outer total-time budget (slow networks are allowed) while the
+        local-only portion runs under ``SIE_MODEL_LOAD_TIMEOUT_S``.
 
-        Note: Dependency checking is done earlier by ModelRegistry._check_model_loadable()
+        Note: Dependency checking is done earlier by ``ModelRegistry._check_model_loadable()``
         before this method is called. This ensures errors surface synchronously.
 
         Args:
@@ -158,16 +211,12 @@ class ModelLoader:
 
         Returns:
             The unloaded adapter instance (may be fallback adapter for non-CUDA devices).
-
-        Raises:
-            RuntimeError: If model not cached and HF fallback is disabled.
         """
         logger.info("Instantiating adapter for model '%s' (device=%s)", name, device)
 
-        # Ensure model weights are cached (cluster cache -> local cache)
-        self._ensure_weights_cached(config)
-
-        # Instantiate the adapter (does not load weights yet)
+        # Instantiate the adapter (does not load weights yet). Weight
+        # caching must already have been performed by the caller via
+        # ``ensure_weights_cached`` — see method docstring.
         return load_adapter(
             config,
             model_dir,
@@ -176,7 +225,7 @@ class ModelLoader:
             attention_backend=self._attention_backend,
         )
 
-    def _ensure_weights_cached(self, config: ModelConfig) -> None:
+    def ensure_weights_cached(self, config: ModelConfig) -> None:
         """Ensure model weights are available in local cache.
 
         Implements the caching hierarchy:
@@ -223,6 +272,22 @@ class ModelLoader:
 
         logger.debug("Model %s available at %s", model_id, cached_path)
 
+    async def ensure_weights_cached_async(self, name: str, config: ModelConfig) -> None:
+        """Async version of :meth:`ensure_weights_cached`.
+
+        Runs the (potentially long) download on the load executor so it
+        doesn't block the event loop. Intentionally NOT wrapped in
+        ``asyncio.wait_for`` — slow networks are allowed; stalls are
+        detected by ``HF_HUB_DOWNLOAD_TIMEOUT`` inside ``huggingface_hub``.
+
+        Args:
+            name: Model name (for logging context only).
+            config: Model configuration.
+        """
+        logger.debug("Ensuring weights cached for '%s'", name)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._load_executor, self.ensure_weights_cached, config)
+
     async def instantiate_adapter_async(
         self,
         name: str,
@@ -230,25 +295,27 @@ class ModelLoader:
         model_dir: Path,
         device: str,
     ) -> ModelAdapter:
-        """Instantiate adapter in thread pool (async version).
+        """Instantiate adapter in the load executor with a post-download timeout.
 
-        Args:
-            name: Model name.
-            config: Model configuration.
-            model_dir: Path to model directory.
-            device: Device string for device-aware adapter selection.
+        Bounded by ``SIE_MODEL_LOAD_TIMEOUT_S`` (default 600 s). On timeout
+        the underlying thread cannot be killed in Python, so the executor
+        is replaced with a fresh single-worker pool — the wedged thread
+        leaks until process exit but new loads can proceed.
 
-        Returns:
-            The unloaded adapter instance (may be fallback adapter for non-CUDA devices).
+        Callers MUST have already invoked :meth:`ensure_weights_cached_async`
+        for this config; this method assumes weights are on local disk.
+
+        Raises:
+            ModelLoadTimeoutError: If instantiation exceeds the configured
+                budget. Classified as ``LoadErrorClass.TIMEOUT`` by the
+                registry's failure recorder, which applies a 30 s cooldown
+                before the next client request can retry.
         """
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._load_executor,
-            self.instantiate_adapter,
-            name,
-            config,
-            model_dir,
-            device,
+        return await self._run_with_timeout(
+            stage="instantiate",
+            name=name,
+            func=self.instantiate_adapter,
+            args=(name, config, model_dir, device),
         )
 
     def load_and_register(
@@ -311,25 +378,115 @@ class ModelLoader:
         adapter: ModelAdapter,
         config: ModelConfig,
     ) -> LoadedModel:
-        """Load adapter in thread pool (for normal adapters).
+        """Load adapter in thread pool with post-download timeout.
 
-        Args:
-            name: Model name.
-            device: Device string.
-            adapter: The adapter to load.
-            config: Model configuration.
+        Bounded by ``SIE_MODEL_LOAD_TIMEOUT_S``. The executor thread runs
+        ONLY ``_run_load_with_markers`` (weight deserialization + warmup);
+        the registry-state side effects (``_finish_load``: pre/postprocessor
+        registration, ``MODEL_LOADED`` gauge, worker creation, LoRA
+        preloading) run on the awaiting coroutine AFTER the future
+        resolves cleanly.
 
-        Returns:
-            LoadedModel containing the loaded state.
+        This split is critical for correctness on timeout: when
+        ``wait_for`` cancels, the orphaned thread keeps running but can
+        only mutate the adapter object itself (which the registry will
+        discard along with the LoadedModel that never gets created). It
+        cannot register stale preprocessors or set ``sie_model_loaded=1``
+        for a model the registry has marked failed.
+
+        ``requires_main_thread`` adapters (e.g. SGLang) are routed through
+        :meth:`_load_main_thread` instead, which intentionally does NOT
+        apply this timeout — those adapters have their own bounded
+        subprocess startup timeout and double-bounding causes spurious
+        mid-startup failures.
         """
-        loop = asyncio.get_running_loop()
 
-        def _load_sync() -> LoadedModel:
+        def _deserialize_and_warmup() -> None:
             logger.info("Loading model '%s' onto %s", name, device)
             _run_load_with_markers(name, device, adapter)
-            return self._finish_load(name, device, adapter, config)
 
-        return await loop.run_in_executor(self._load_executor, _load_sync)
+        await self._run_with_timeout(
+            stage="load",
+            name=name,
+            func=_deserialize_and_warmup,
+            args=(),
+        )
+        # Registry-state side effects (preprocessor/postprocessor
+        # registration, metrics, worker creation, LoRA preloading) run
+        # OUTSIDE the executor so an orphan thread from a wait_for
+        # cancellation cannot corrupt registry state. Safe to call from
+        # the awaiting coroutine: only cheap Python work, no I/O.
+        return self._finish_load(name, device, adapter, config)
+
+    async def _run_with_timeout(
+        self,
+        *,
+        stage: str,
+        name: str,
+        func: Any,
+        args: tuple[Any, ...],
+    ) -> Any:
+        """Run ``func(*args)`` in the load executor under the post-download budget.
+
+        Centralises the ``wait_for`` + executor-recreate dance shared by
+        :meth:`instantiate_adapter_async` and :meth:`_load_in_executor`. A
+        timeout of ``0`` (or negative, via env) disables the wrapper and
+        the call runs unbounded — matches the PR convention.
+
+        On timeout:
+          1. The asyncio task awaiting the executor future is cancelled
+             via ``wait_for``. The underlying Python thread continues to
+             run; it cannot be interrupted from outside.
+          2. The wedged executor is ``shutdown(wait=False)``'d and replaced
+             with a fresh single-worker pool so subsequent loads do not
+             queue behind the leaked thread (the registry holds
+             ``_load_lock`` while awaiting us, so this happens with the
+             registry quiesced).
+          3. ``sie_model_load_timeouts_total{model, stage}`` is incremented
+             and a structured error is logged.
+          4. :class:`ModelLoadTimeoutError` is raised; the registry's
+             ``_record_load_failure`` will classify it as ``TIMEOUT`` and
+             install a 30 s cooldown.
+        """
+        loop = asyncio.get_running_loop()
+        timeout = self._model_load_timeout_s
+        started = time.monotonic()
+        fut = loop.run_in_executor(self._load_executor, func, *args)
+
+        # Disabled: no wait_for wrapper, behave exactly like the pre-PR code.
+        if timeout <= 0:
+            return await fut
+
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except TimeoutError as exc:
+            elapsed = time.monotonic() - started
+            logger.error(
+                "Model load timeout: model=%s stage=%s elapsed_s=%.1f timeout_s=%.0f",
+                name,
+                stage,
+                elapsed,
+                timeout,
+            )
+            increment_model_load_timeout(name, stage)
+            # The thread keeps running with a stale adapter/config; we
+            # cannot kill it. Replace the executor so the next load is
+            # not queued behind the leaked worker.
+            self._recreate_executor()
+            raise ModelLoadTimeoutError(model=name, stage=stage, elapsed_s=elapsed, timeout_s=timeout) from exc
+
+    def _recreate_executor(self) -> None:
+        """Discard the current load executor and create a fresh one.
+
+        Called on timeout: the in-flight thread cannot be terminated, so
+        we orphan it (``shutdown(wait=False)`` returns immediately without
+        joining) and bind ``self._load_executor`` to a new single-worker
+        pool. The orphan thread continues to consume RAM/GPU until process
+        exit; ``sie_model_load_timeouts_total`` lets ops observe the rate.
+        """
+        old = self._load_executor
+        self._load_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-load")
+        old.shutdown(wait=False)
 
     def _load_main_thread(
         self,
@@ -343,6 +500,12 @@ class ModelLoader:
         This blocks the event loop but is required for adapters like SGLang
         that use Python signal handlers which only work in the main thread.
 
+        Adapter-internal startup timeouts (e.g. SGLang's subprocess health
+        poll) are rewrapped into :class:`ModelLoadTimeoutError` so the
+        registry's failure classifier buckets them as
+        ``LoadErrorClass.TIMEOUT`` (30 s cooldown) rather than
+        ``UNKNOWN`` (permanent) — consistent with the executor path.
+
         Args:
             name: Model name.
             device: Device string.
@@ -353,7 +516,27 @@ class ModelLoader:
             LoadedModel containing the loaded state.
         """
         logger.info("Loading model '%s' onto %s (main thread)", name, device)
-        _run_load_with_markers(name, device, adapter)
+        started = time.monotonic()
+        try:
+            _run_load_with_markers(name, device, adapter)
+        except RuntimeError as exc:
+            # SGLang raises ``RuntimeError("SGLang server failed to start
+            # within timeout")`` from ``_wait_for_server``. Pattern-match
+            # on the message; narrow enough to not bucket genuine runtime
+            # failures as timeouts. Other adapters that grow their own
+            # startup timeouts should follow the same convention.
+            msg = str(exc).lower()
+            if "failed to start within timeout" in msg or "startup timeout" in msg:
+                elapsed = time.monotonic() - started
+                increment_model_load_timeout(name, "load")
+                logger.error(
+                    "Main-thread adapter startup timeout: model=%s elapsed_s=%.1f msg=%s",
+                    name,
+                    elapsed,
+                    exc,
+                )
+                raise ModelLoadTimeoutError(model=name, stage="load", elapsed_s=elapsed, timeout_s=elapsed) from exc
+            raise
         return self._finish_load(name, device, adapter, config)
 
     def _finish_load(

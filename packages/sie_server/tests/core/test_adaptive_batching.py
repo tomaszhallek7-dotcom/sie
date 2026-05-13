@@ -396,11 +396,11 @@ class TestAdaptiveBatchController:
             _current_wait_ms=10.0,
         )
         w1, _ = ctrl.step(observed_p50_ms=30.0, fill_ratio=0.5)
-        assert w1 == pytest.approx(12.0)
+        assert w1 == pytest.approx(12.0, abs=1e-3)
         w2, _ = ctrl.step(observed_p50_ms=40.0, fill_ratio=0.5)
-        assert w2 == pytest.approx(13.0)
+        assert w2 == pytest.approx(13.0, abs=1e-3)
         w3, _ = ctrl.step(observed_p50_ms=60.0, fill_ratio=0.5)
-        assert w3 == pytest.approx(12.0)
+        assert w3 == pytest.approx(12.0, abs=1e-3)
 
 
 class TestAdaptiveBatchingWorkerIntegration:

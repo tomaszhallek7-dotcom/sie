@@ -1,3 +1,14 @@
+# IMPORTANT: install HF timeout defaults before any transitive import of
+# ``huggingface_hub``. Inlined (not imported from a sie_server submodule)
+# to avoid triggering ``sie_server.core.__init__`` — which pulls in
+# adapters — before the env vars are set. Mirrored from ``cli.py`` to
+# cover uvicorn ``reload=True`` worker re-imports (cli is not re-executed
+# in workers; they invoke this factory directly).
+import os
+
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
+
 import uvicorn
 from fastapi import FastAPI
 

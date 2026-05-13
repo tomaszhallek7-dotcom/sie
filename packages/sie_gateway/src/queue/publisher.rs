@@ -277,10 +277,12 @@ fn extract_request_id_fast(payload: &[u8]) -> Option<&str> {
     let marker = rmp::decode::read_marker(&mut &payload[..]).ok()?;
 
     match marker {
-        // Array format: request_id is the first element
-        Marker::FixArray(n) if n >= 1 => {
+        // Array format follows WorkResult field order:
+        // work_item_id, request_id, item_index, ...
+        Marker::FixArray(n) if n >= 2 => {
             // Marker byte consumed 1 byte
-            let (request_id, _) = read_str_from_slice(&payload[1..]).ok()?;
+            let data = skip_msgpack_value(&payload[1..])?;
+            let (request_id, _) = read_str_from_slice(data).ok()?;
             Some(request_id)
         }
         Marker::Array16 => {
@@ -289,10 +291,11 @@ fn extract_request_id_fast(payload: &[u8]) -> Option<&str> {
                 return None;
             }
             let len = u16::from_be_bytes([payload[1], payload[2]]);
-            if len < 1 {
+            if len < 2 {
                 return None;
             }
-            let (request_id, _) = read_str_from_slice(&payload[3..]).ok()?;
+            let data = skip_msgpack_value(&payload[3..])?;
+            let (request_id, _) = read_str_from_slice(data).ok()?;
             Some(request_id)
         }
         Marker::Array32 => {
@@ -301,10 +304,11 @@ fn extract_request_id_fast(payload: &[u8]) -> Option<&str> {
                 return None;
             }
             let len = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
-            if len < 1 {
+            if len < 2 {
                 return None;
             }
-            let (request_id, _) = read_str_from_slice(&payload[5..]).ok()?;
+            let data = skip_msgpack_value(&payload[5..])?;
+            let (request_id, _) = read_str_from_slice(data).ok()?;
             Some(request_id)
         }
 
@@ -1475,7 +1479,7 @@ mod tests {
         };
         let encoded = rmp_serde::to_vec(&result).unwrap();
         let extracted = extract_request_id_fast(&encoded);
-        assert_eq!(extracted, Some("abc-123-def.0"));
+        assert_eq!(extracted, Some("abc-123-def"));
     }
 
     #[test]
@@ -1538,8 +1542,7 @@ mod tests {
         };
         let encoded = rmp_serde::to_vec(&result).unwrap();
         let extracted = extract_request_id_fast(&encoded);
-        // First field in array format is work_item_id
-        assert!(extracted.is_some());
+        assert_eq!(extracted, Some(uuid_str));
     }
 
     #[test]

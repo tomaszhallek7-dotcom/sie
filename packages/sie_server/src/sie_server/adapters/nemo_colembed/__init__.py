@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +48,10 @@ _ERR_NO_INPUT = "NemoColEmbedAdapter requires either text or images input"
 _ERR_REQUIRES_FLASH_ATTN = (
     "NemoColEmbedAdapter requires flash_attn. Install with: pip install flash-attn --no-build-isolation"
 )
+
+# Serializes the v1 ``config_class.to_dict`` monkey-patch so concurrent v1
+# loads cannot observe a partially-restored serializer or race on the restore.
+_V1_TO_DICT_PATCH_LOCK = threading.Lock()
 
 
 class NemoColEmbedAdapter(BaseAdapter):
@@ -111,9 +116,78 @@ class NemoColEmbedAdapter(BaseAdapter):
             device: Device string (e.g., "cuda:0", "cpu").
 
         Raises:
-            ImportError: If flash_attn is not installed.
+            ImportError: If flash_attn is required by the model and not installed.
         """
-        # Check flash_attn is available (required by this model)
+        from transformers import AutoModel
+
+        self._device = device
+
+        # Determine dtype
+        dtype = self._resolve_dtype()
+        attn_impl = self._resolve_attn_implementation(device)
+
+        logger.info(
+            "Loading NeMo ColEmbed model %s on device=%s with dtype=%s, attn=%s",
+            self._model_name_or_path,
+            device,
+            dtype,
+            attn_impl,
+        )
+
+        # Try AutoModel first (works for v2: Qwen3-VL backbone, registers cleanly).
+        # Fall back to v1's explicit dynamic-module path with the to_dict monkey-patch
+        # if AutoModel can't resolve the custom architecture. The fallback covers:
+        #  - KeyError / ValueError: AutoModel can't find a matching architecture
+        #  - ImportError: the dynamic modeling file imports flash_attn at module
+        #    top (v1 ships its own modeling file that does this)
+        #  - AttributeError: v1's config.to_dict() bug fires inside transformers'
+        #    to_diff_dict() comparison when vision_config is absent
+        loaded_via_v1_path = False
+        try:
+            self._model = AutoModel.from_pretrained(
+                self._model_name_or_path,
+                trust_remote_code=True,
+                device_map=device,
+                torch_dtype=dtype,
+                attn_implementation=attn_impl,
+            )
+        except (KeyError, ValueError, ImportError, AttributeError) as automodel_err:
+            logger.info(
+                "AutoModel.from_pretrained failed for %s (%s: %s); falling back to v1 dynamic-module load path",
+                self._model_name_or_path,
+                type(automodel_err).__name__,
+                automodel_err,
+            )
+            self._model = self._load_v1_dynamic(device, dtype)
+            loaded_via_v1_path = True
+
+        self._model.eval()
+
+        # Discover embedding dim with a fallback chain:
+        #   1. config.embedding_dim (v1: 128)
+        #   2. config.hidden_size  (v2: 2560)
+        #   3. constructor token_dim (last-resort default)
+        embedding_dim = getattr(self._model.config, "embedding_dim", None)
+        if embedding_dim is None:
+            embedding_dim = getattr(self._model.config, "hidden_size", None)
+        if isinstance(embedding_dim, int) and embedding_dim > 0:
+            self._multivector_dim = embedding_dim
+
+        # Create preprocessor only when the model exposes v1-style attrs (image_size,
+        # num_image_token). v2 (Qwen3-VL) does not, and the SigLIP+Llama-keyed
+        # NemoColEmbedPreprocessor does not apply.
+        if loaded_via_v1_path or (hasattr(self._model, "image_size") and hasattr(self._model, "num_image_token")):
+            self._create_processor()
+        else:
+            logger.info("Skipping NemoColEmbedPreprocessor — model lacks v1 attrs (likely v2 backbone).")
+
+    def _load_v1_dynamic(self, device: str, dtype: torch.dtype) -> Any:
+        """Load v1 (SigLIP+Llama) via the explicit dynamic-module path.
+
+        This path applies a ``to_dict`` monkey-patch to work around a v1
+        config bug that assumes ``vision_config`` always exists. v1 also
+        requires ``flash_attention_2``.
+        """
         try:
             import flash_attn  # ty: ignore[unresolved-import]
         except ImportError as e:
@@ -121,66 +195,60 @@ class NemoColEmbedAdapter(BaseAdapter):
 
         from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-        self._device = device
-
-        # Determine dtype
-        dtype = self._resolve_dtype()
-
-        logger.info(
-            "Loading NeMo ColEmbed model %s on device=%s with dtype=%s",
-            self._model_name_or_path,
-            device,
-            dtype,
-        )
-
-        # Load model class directly to bypass AutoModel/AutoConfig introspection.
         model_class = get_class_from_dynamic_module(
             "modeling_llama_nemoretrievercolembed.llama_NemoRetrieverColEmbed",
             self._model_name_or_path,
             trust_remote_code=True,
         )
 
-        # NVIDIA's config has a bug: to_dict() assumes vision_config exists but it doesn't.
-        # The bug is triggered during transformers' to_diff_dict() which creates a new config
-        # instance to compare defaults. Monkey-patch the config class to fix it.
+        # v1's config.to_dict() bug: assumes vision_config exists but it doesn't.
+        # Triggered during transformers' to_diff_dict() comparison. Patch around it
+        # only for this v1 fallback path — v2 inherits from Qwen3VLConfig cleanly.
+        # Serialized with _V1_TO_DICT_PATCH_LOCK so concurrent v1 loads can't leak
+        # the patched serializer or race on the restore.
         config_class = model_class.config_class  # ty:ignore[unresolved-attribute]
-        original_to_dict = config_class.to_dict
 
         def patched_to_dict(self: Any) -> dict[str, Any]:
-            """Patched to_dict that handles missing vision_config."""
+            """Patched to_dict that handles missing vision_config (v1 only)."""
             import copy
 
             output = copy.deepcopy(self.__dict__)
-            # Only include vision_config if it exists
             if hasattr(self, "vision_config") and self.vision_config is not None:
                 output["vision_config"] = self.vision_config.to_dict()
-            # Only include llm_config if it exists
             if hasattr(self, "llm_config") and self.llm_config is not None:
                 output["llm_config"] = self.llm_config.to_dict()
             output["model_type"] = self.__class__.model_type
             return output
 
-        config_class.to_dict = patched_to_dict
+        with _V1_TO_DICT_PATCH_LOCK:
+            original_to_dict = config_class.to_dict
+            config_class.to_dict = patched_to_dict
+            try:
+                return model_class.from_pretrained(  # ty:ignore[unresolved-attribute]
+                    self._model_name_or_path,
+                    device_map=device,
+                    torch_dtype=dtype,
+                    attn_implementation="flash_attention_2",
+                )
+            finally:
+                config_class.to_dict = original_to_dict
 
+    def _resolve_attn_implementation(self, device: str) -> str:
+        """Return ``flash_attention_2`` when available on CUDA, else ``sdpa``.
+
+        v2 (Qwen3-VL) tolerates ``sdpa`` cleanly. v1 still requires
+        ``flash_attention_2`` and that requirement is enforced inside
+        ``_load_v1_dynamic`` via an explicit ``import flash_attn`` check.
+        """
+        if not str(device).startswith("cuda"):
+            return "sdpa"
         try:
-            self._model = model_class.from_pretrained(  # ty:ignore[unresolved-attribute]
-                self._model_name_or_path,
-                device_map=device,
-                torch_dtype=dtype,
-                attn_implementation="flash_attention_2",
-            )
-        finally:
-            # Restore original to_dict after loading
-            config_class.to_dict = original_to_dict
+            import flash_attn  # ty: ignore[unresolved-import]
 
-        self._model.eval()
-
-        # Get embedding dimension from model config if available
-        if hasattr(self._model.config, "embedding_dim"):
-            self._multivector_dim = self._model.config.embedding_dim
-
-        # Create preprocessor for conformance with SIE infrastructure
-        self._create_processor()
+            return "flash_attention_2"
+        except ImportError:
+            logger.info("flash_attn not available, using sdpa attention")
+            return "sdpa"
 
     def _resolve_dtype(self) -> torch.dtype:
         """Resolve dtype based on device and config."""
@@ -307,19 +375,13 @@ class NemoColEmbedAdapter(BaseAdapter):
         with torch.inference_mode():
             embeddings = self._model.forward_queries(texts, batch_size=self._batch_size)
 
-        # embeddings is a list of tensors [seq_len, dim] for each query
-        multivector_list = []
-        for emb in embeddings:
-            if isinstance(emb, torch.Tensor):
-                if self._normalize:
-                    emb = functional.normalize(emb, p=2, dim=-1)
-                emb = emb.float().cpu().numpy()
-            else:
-                emb = np.array(emb, dtype=np.float32)
-                if self._normalize:
-                    emb = emb / np.linalg.norm(emb, axis=-1, keepdims=True)
+        multivector_list = self._unpack_embeddings(embeddings, expected_count=len(texts))
 
-            multivector_list.append(emb)
+        # Free GPU memory to prevent OOM on subsequent calls
+        del embeddings
+        if self._device and self._device.startswith("cuda"):
+            torch.cuda.empty_cache()
+        _ = functional  # silence unused-import in some lint passes
 
         return EncodeOutput(
             multivector=multivector_list,
@@ -329,7 +391,7 @@ class NemoColEmbedAdapter(BaseAdapter):
         )
 
     def _encode_images(self, items: list[Any], *, is_query: bool) -> EncodeOutput:
-        """Encode document images using forward_passages().
+        """Encode document images using forward_images() (v2) or forward_passages() (v1).
 
         Args:
             items: List of items with images.
@@ -339,7 +401,6 @@ class NemoColEmbedAdapter(BaseAdapter):
             EncodeOutput with multivector embeddings.
         """
         from PIL import Image
-        from torch.nn import functional
 
         # Item is a TypedDict (dict) - no instance check needed
         pil_images = []
@@ -354,23 +415,13 @@ class NemoColEmbedAdapter(BaseAdapter):
                 pil_img = pil_img.convert("RGB")
             pil_images.append(pil_img)
 
-        # Use model's forward_passages method
+        # v2 exposes ``forward_images`` (Qwen3-VL backbone); v1 exposes ``forward_passages``.
+        forward = getattr(self._model, "forward_images", None) or self._model.forward_passages
+
         with torch.inference_mode():
-            embeddings = self._model.forward_passages(pil_images, batch_size=self._batch_size)
+            embeddings = forward(pil_images, batch_size=self._batch_size)
 
-        # embeddings is a list of tensors [num_patches, dim] for each image
-        multivector_list = []
-        for emb in embeddings:
-            if isinstance(emb, torch.Tensor):
-                if self._normalize:
-                    emb = functional.normalize(emb, p=2, dim=-1)
-                emb = emb.float().cpu().numpy()
-            else:
-                emb = np.array(emb, dtype=np.float32)
-                if self._normalize:
-                    emb = emb / np.linalg.norm(emb, axis=-1, keepdims=True)
-
-            multivector_list.append(emb)
+        multivector_list = self._unpack_embeddings(embeddings, expected_count=len(pil_images))
 
         # Free GPU memory to prevent OOM on subsequent calls
         del embeddings
@@ -383,6 +434,58 @@ class NemoColEmbedAdapter(BaseAdapter):
             is_query=is_query,
             multivector_token_dim=self._multivector_dim,
         )
+
+    def _unpack_embeddings(
+        self,
+        embeddings: Any,
+        *,
+        expected_count: int,
+    ) -> list[np.ndarray]:
+        """Convert v1's list-of-Tensor or v2's padded (B, S, D) tensor to per-item numpy.
+
+        v1 ``forward_queries``/``forward_passages`` return ``list[Tensor]`` where
+        each entry is ``[seq, dim]``. v2 returns a single padded tensor of shape
+        ``[batch, max_seq, dim]``. Normalize per-row when ``self._normalize``.
+        """
+        from torch.nn import functional
+
+        results: list[np.ndarray] = []
+
+        if isinstance(embeddings, torch.Tensor):
+            if embeddings.ndim != 3:
+                msg = (
+                    f"NemoColEmbed: unexpected embedding tensor shape {tuple(embeddings.shape)}; "
+                    f"expected 3D [batch, seq, dim]"
+                )
+                raise RuntimeError(msg)
+            # v2 right-pads with zero rows so all rows in a batch share a sequence
+            # length. Detect padding before normalization (zero rows become NaN
+            # after L2 normalize) and drop them per-item so downstream MaxSim
+            # doesn't consume padding tokens as content.
+            nonzero_mask = embeddings.abs().sum(dim=-1) > 0
+            tensor = embeddings
+            if self._normalize:
+                tensor = functional.normalize(tensor, p=2, dim=-1)
+            for i in range(tensor.shape[0]):
+                keep = nonzero_mask[i]
+                results.append(tensor[i][keep].float().cpu().numpy())
+            return results
+
+        # Iterable of per-item tensors / arrays (v1 path)
+        for emb in embeddings:
+            if isinstance(emb, torch.Tensor):
+                if self._normalize:
+                    emb = functional.normalize(emb, p=2, dim=-1)
+                results.append(emb.float().cpu().numpy())
+            else:
+                arr = np.asarray(emb, dtype=np.float32)
+                if self._normalize:
+                    arr = arr / np.linalg.norm(arr, axis=-1, keepdims=True)
+                results.append(arr)
+
+        if len(results) != expected_count:
+            logger.warning("NemoColEmbed: expected %d embeddings, got %d", expected_count, len(results))
+        return results
 
     def _encode_images_preprocessed(
         self,
@@ -410,6 +513,13 @@ class NemoColEmbedAdapter(BaseAdapter):
         from torch.nn import functional
 
         from sie_server.types.inputs import Item
+
+        # Belt-and-braces: if no v1 preprocessor (e.g., v2 backbone), defer to the
+        # native forward_images / forward_passages path. The dispatch in ``encode()``
+        # already short-circuits on payload type, so this only triggers when a caller
+        # invokes _encode_images_preprocessed directly.
+        if self._processor is None:
+            return self._encode_images(items, is_query=is_query)
 
         # Process in sub-batches to maximize GPU utilization while avoiding OOM
         # NemoColEmbed supports batching - model maps tiles to sequences via IMG_CONTEXT token counts

@@ -1,7 +1,19 @@
 from __future__ import annotations
 
-import logging
+# IMPORTANT: HF timeout defaults must be installed BEFORE ``huggingface_hub``
+# is imported anywhere in the process (the library reads HF_HUB_*_TIMEOUT
+# at module import time). Inlined here — rather than imported from
+# ``sie_server.core.hf_env`` — because importing ``sie_server.core.*``
+# triggers ``core/__init__.py`` which transitively pulls in adapters and
+# could one day import ``huggingface_hub`` itself, latching the stock 10 s
+# defaults before our overrides land. Keep these two ``setdefault`` lines
+# as the very first executable statements after ``__future__``.
 import os
+
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
+
+import logging
 from pathlib import Path
 
 import typer

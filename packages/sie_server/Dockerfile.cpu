@@ -18,14 +18,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_LINK_MODE=copy \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# build-essential + git are builder-only; they do NOT leak into the runtime stage.
+# build-essential + git + zlib1g-dev are builder-only; they do NOT leak into the runtime stage.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     curl \
-    git
+    git \
+    zlib1g-dev
 
 ARG UV_VERSION=0.9.28
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh \
@@ -154,13 +155,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
     OMP_NUM_THREADS=4 \
     MKL_NUM_THREADS=4
 
-# Only the shared libs torch + pillow actually dlopen at runtime.
+# Only the shared libs torch + pillow + rtree actually dlopen at runtime.
+# libspatialindex-c6: rtree (docling dep) dlopens libspatialindex_c.so; the
+# rtree==1.4.1 wheel only bundles the C++ core, not the C wrapper.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     libjpeg62-turbo \
-    libpng16-16
+    libpng16-16 \
+    libspatialindex-c6
 
 RUN groupadd -g 1000 sie && useradd -u 1000 -g sie -m sie
 

@@ -3,7 +3,7 @@
   "info": {
     "title": "SIE Server",
     "description": "Search Inference Engine - GPU inference server for search workloads",
-    "version": "0.3.2"
+    "version": "0.3.3"
   },
   "paths": {
     "/": {
@@ -1740,7 +1740,7 @@
               }
             ],
             "default": null,
-            "description": "Adapter-specific options",
+            "description": "Adapter-specific options. Recognized sub-keys include 'overflow_policy' (one of 'default', 'truncate_text', 'error'; default 'default') controlling how inputs exceeding the model's max_sequence_length are handled.",
             "title": "Options"
           }
         },
@@ -1762,6 +1762,23 @@
                 "organization",
                 "location"
               ]
+            }
+          },
+          {
+            "items": [
+              {
+                "text": "Apple Inc. was founded by Steve Jobs in Cupertino, California."
+              }
+            ],
+            "params": {
+              "labels": [
+                "person",
+                "organization",
+                "location"
+              ],
+              "options": {
+                "overflow_policy": "truncate_text"
+              }
             }
           }
         ],

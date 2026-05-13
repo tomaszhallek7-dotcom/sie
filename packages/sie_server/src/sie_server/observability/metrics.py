@@ -112,6 +112,15 @@ MODEL_MEMORY_BYTES = Gauge(
     ["model", "device"],
 )
 
+MODEL_LOAD_TIMEOUTS = Counter(
+    "sie_model_load_timeouts_total",
+    "Number of post-download model-load timeouts, broken down by stage. "
+    "Stage is one of: ``instantiate`` (adapter object construction) or "
+    "``load`` (adapter.load + warmup). Download is bounded separately by "
+    "HF_HUB_DOWNLOAD_TIMEOUT and does NOT increment this counter.",
+    ["model", "stage"],
+)
+
 
 # -----------------------------------------------------------------------------
 # OOM Recovery Metrics
@@ -292,6 +301,17 @@ def set_model_memory(model: str, device: str, memory_bytes: int) -> None:
         memory_bytes: Estimated GPU memory usage in bytes.
     """
     MODEL_MEMORY_BYTES.labels(model=model, device=device).set(memory_bytes)
+
+
+def increment_model_load_timeout(model: str, stage: str) -> None:
+    """Increment the ``sie_model_load_timeouts_total`` counter.
+
+    Args:
+        model: Model name.
+        stage: One of ``instantiate`` or ``load``. Download stalls are
+            handled by ``huggingface_hub`` and are not counted here.
+    """
+    MODEL_LOAD_TIMEOUTS.labels(model=model, stage=stage).inc()
 
 
 def record_oom_recovery_event(

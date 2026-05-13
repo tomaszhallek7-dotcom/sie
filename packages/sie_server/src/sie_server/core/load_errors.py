@@ -28,6 +28,7 @@ class LoadErrorClass(StrEnum):
     OOM = "OOM"
     NETWORK = "NETWORK"
     DEPENDENCY = "DEPENDENCY"
+    TIMEOUT = "TIMEOUT"
     UNKNOWN = "UNKNOWN"
 
 
@@ -43,7 +44,27 @@ _COOLDOWN_BY_CLASS: dict[LoadErrorClass, float | None] = {
     LoadErrorClass.UNKNOWN: _PERMANENT,
     LoadErrorClass.OOM: 60.0,
     LoadErrorClass.NETWORK: 30.0,
+    LoadErrorClass.TIMEOUT: 30.0,
 }
+
+
+class ModelLoadTimeoutError(TimeoutError):
+    """Raised when a post-download load stage exceeds ``SIE_MODEL_LOAD_TIMEOUT_S``.
+
+    Subclasses ``TimeoutError`` so callers that only know about the built-in
+    type still match, but the dedicated class lets ``classify_load_error``
+    bucket these into :class:`LoadErrorClass.TIMEOUT` rather than the
+    generic ``NETWORK`` bucket. Carries structured fields for ops triage.
+    """
+
+    def __init__(self, *, model: str, stage: str, elapsed_s: float, timeout_s: float) -> None:
+        self.model = model
+        self.stage = stage
+        self.elapsed_s = elapsed_s
+        self.timeout_s = timeout_s
+        super().__init__(
+            f"Model '{model}' {stage} exceeded timeout: elapsed={elapsed_s:.1f}s, configured={timeout_s:.0f}s"
+        )
 
 
 @dataclass(frozen=True)
@@ -77,6 +98,17 @@ def classify_load_error(exc: BaseException) -> LoadFailureClassification:
     Returns:
         Classification with the canonical class and cooldown.
     """
+    # Our own post-download load timeout — must come BEFORE the generic
+    # ``TimeoutError`` → NETWORK branch below, since this subclasses
+    # ``TimeoutError``. Bucketed separately so the metric and the
+    # operator-facing message identify "stuck local load" distinct from
+    # "stuck network".
+    if isinstance(exc, ModelLoadTimeoutError):
+        return LoadFailureClassification(
+            error_class=LoadErrorClass.TIMEOUT,
+            cooldown_s=_COOLDOWN_BY_CLASS[LoadErrorClass.TIMEOUT],
+        )
+
     # Gated repo (HF auth) — permanent until operator fixes HF_TOKEN.
     if isinstance(exc, GatedModelError):
         return LoadFailureClassification(

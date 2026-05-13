@@ -18,6 +18,7 @@ use crate::queue::publisher;
 
 use crate::server::AppState;
 use crate::state::model_registry::ResolveError;
+use crate::state::pool_manager::DEFAULT_POOL_NAME;
 use crate::state::worker_registry::WorkerRegistry;
 use crate::types::AuditEntry;
 
@@ -103,11 +104,9 @@ struct PoolLookup {
     /// `true` iff a healthy worker with a non-empty pool name existed
     /// for the exact `(bundle, gpu)` tuple at lookup time.
     ///
-    /// Always `false` when `gpu.is_empty()` (no exact tuple to match)
-    /// or when `pool_name` was caller-pinned (we short-circuit the
-    /// registry lookup entirely in that case — callers that care
-    /// about demand tracking already know to record it before
-    /// trusting the pin).
+    /// Always `false` when `gpu.is_empty()` (no exact tuple to match).
+    /// Caller-pinned pools still probe the registry when a GPU is
+    /// present so demand tracking can avoid spurious scale-up signals.
     exact_gpu_match: bool,
 }
 
@@ -121,10 +120,10 @@ struct PoolLookup {
 ///   there unconditionally. This preserves the "power user" path where
 ///   the client knows exactly which pool it wants (including cold ones
 ///   that are expected to scale up on demand).
-/// - Otherwise look up a healthy worker for `(bundle, gpu)`. If GPU was
-///   specified and the exact tuple has no worker, fall back to any worker
-///   on `bundle` (covers single-GPU clusters where the profile-level
-///   distinction is cosmetic).
+/// - Otherwise look up a healthy default-pool worker for `(bundle, gpu)`.
+///   If GPU was specified and the exact tuple has no worker, fall back to
+///   any default-pool worker on `bundle` (covers single-GPU clusters where
+///   the profile-level distinction is cosmetic).
 /// - If nothing resolves, return `Provisioning` so the caller can emit
 ///   `202 + Retry-After` — regardless of whether the caller sent
 ///   `X-SIE-MACHINE-PROFILE`. Before the fix this branch only fired when
@@ -155,15 +154,22 @@ async fn resolve_effective_pool(
 
     // Primary lookup. Folds the "was the exact tuple routable?"
     // question into the same registry load we use to pick a pool.
-    let primary = registry.resolve_queue_pool(bundle, gpu).await;
+    let primary = registry
+        .resolve_queue_pool_in_pool(bundle, gpu, DEFAULT_POOL_NAME)
+        .await;
     let exact_gpu_match = !gpu.is_empty() && primary.is_some();
 
     // Fallback: caller expressed a GPU preference but nothing matches;
-    // try any healthy worker on the bundle. This covers single-GPU
-    // clusters where the profile-level distinction is cosmetic.
+    // try any healthy default-pool worker on the bundle. This covers
+    // single-GPU clusters where the profile-level distinction is cosmetic
+    // without leaking traffic into caller-created isolation pools.
     let resolved = match primary {
         Some(p) => Some(p),
-        None if !gpu.is_empty() => registry.resolve_queue_pool(bundle, "").await,
+        None if !gpu.is_empty() => {
+            registry
+                .resolve_queue_pool_in_pool(bundle, "", DEFAULT_POOL_NAME)
+                .await
+        }
         None => None,
     };
 
@@ -1183,26 +1189,6 @@ fn result_decode_error_value(r: &publisher::WorkResult, message: String) -> serd
     })
 }
 
-fn validated_msgpack_result_blob(r: &publisher::WorkResult) -> Vec<u8> {
-    match rmp_serde::from_slice::<rmpv::Value>(&r.result_msgpack) {
-        Ok(_) => r.result_msgpack.clone(),
-        Err(err) => {
-            let placeholder =
-                result_decode_error_value(r, format!("failed to decode result_msgpack: {err}"));
-            rmp_serde::to_vec(&placeholder).unwrap_or_else(|_| {
-                rmp_serde::to_vec(&json!({
-                    "item_index": r.item_index,
-                    "error": {
-                        "code": "RESULT_DECODE_FAILED",
-                        "message": "failed to encode result decode error",
-                    },
-                }))
-                .unwrap_or_default()
-            })
-        }
-    }
-}
-
 fn build_queue_success_body(
     endpoint: &str,
     model: &str,
@@ -1217,26 +1203,29 @@ fn build_queue_success_body(
 
     if use_msgpack {
         // Msgpack: build {"model": ..., "items"|"scores": [raw_blobs...]}
-        // at byte level. Partial per-item failures are deliberately omitted
-        // from 200 bodies to keep parity with the Python server envelope.
-        let result_blobs: Vec<Vec<u8>> = successful
+        // at byte level. The worker already produced msgpack bytes, so the
+        // success path trusts and appends them directly instead of decoding and
+        // cloning every blob. JSON responses still decode defensively below.
+        let payload_len = successful
             .iter()
-            .map(|r| validated_msgpack_result_blob(r))
-            .collect();
+            .map(|r| r.result_msgpack.len())
+            .sum::<usize>();
         let mut packer = rmp::encode::buffer::ByteBuf::new();
         rmp::encode::write_map_len(&mut packer, 2).unwrap();
         rmp::encode::write_str(&mut packer, "model").unwrap();
         rmp::encode::write_str(&mut packer, model).unwrap();
         rmp::encode::write_str(&mut packer, content_key).unwrap();
-        if endpoint == "score" && result_blobs.len() == 1 {
+        if endpoint == "score" && successful.len() == 1 {
             let mut parts = packer.into_vec();
-            parts.extend_from_slice(&result_blobs[0]);
+            parts.reserve(payload_len);
+            parts.extend_from_slice(&successful[0].result_msgpack);
             parts
         } else {
-            rmp::encode::write_array_len(&mut packer, result_blobs.len() as u32).unwrap();
+            rmp::encode::write_array_len(&mut packer, successful.len() as u32).unwrap();
             let mut parts = packer.into_vec();
-            for blob in &result_blobs {
-                parts.extend_from_slice(blob);
+            parts.reserve(payload_len);
+            for result in successful {
+                parts.extend_from_slice(&result.result_msgpack);
             }
             parts
         }
@@ -2662,28 +2651,21 @@ mod tests {
     }
 
     #[test]
-    fn test_queue_success_body_msgpack_preserves_decode_failure_item() {
+    fn test_queue_success_body_msgpack_trusts_worker_item_bytes() {
         let bad = _ok_result(0, vec![0xc1]);
         let body = build_queue_success_body("encode", "model-a", &[&bad], true);
-        let parsed: serde_json::Value = rmp_serde::from_slice(&body).unwrap();
 
-        assert_eq!(parsed["model"], "model-a");
-        let items = parsed["items"].as_array().unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["item_index"], 0);
-        assert_eq!(items[0]["work_item_id"], "req.0");
-        assert_eq!(items[0]["error"]["code"], "RESULT_DECODE_FAILED");
+        assert!(rmp_serde::from_slice::<serde_json::Value>(&body).is_err());
+        assert_eq!(body.last().copied(), Some(0xc1));
     }
 
     #[test]
-    fn test_queue_success_body_score_msgpack_replaces_bad_single_payload() {
+    fn test_queue_success_body_score_msgpack_trusts_worker_item_bytes() {
         let bad = _ok_result(0, vec![0xc1]);
         let body = build_queue_success_body("score", "model-a", &[&bad], true);
-        let parsed: serde_json::Value = rmp_serde::from_slice(&body).unwrap();
 
-        assert_eq!(parsed["model"], "model-a");
-        assert_eq!(parsed["scores"]["item_index"], 0);
-        assert_eq!(parsed["scores"]["error"]["code"], "RESULT_DECODE_FAILED");
+        assert!(rmp_serde::from_slice::<serde_json::Value>(&body).is_err());
+        assert_eq!(body.last().copied(), Some(0xc1));
     }
 
     #[test]
@@ -3596,15 +3578,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_resolve_effective_pool_ignores_isolated_pool_when_unpinned() {
+        // Bare `gpu` traffic belongs to the default pool. A healthy
+        // worker in a caller-created isolation pool must not receive
+        // unpinned traffic just because it matches `(bundle, gpu)`.
+        let reg = pool_registry();
+        reg.update_worker(
+            "http://w1:8080",
+            worker_msg("default", "l4-spot", "eval-l4"),
+        )
+        .await;
+
+        let out = resolve_effective_pool(&reg, "default", "l4-spot", "").await;
+        assert_eq!(out.resolution, PoolResolution::Provisioning);
+        assert!(!out.exact_gpu_match);
+    }
+
+    #[tokio::test]
     async fn test_resolve_effective_pool_bundle_only_fallback_when_gpu_mismatch() {
         // Client pinned `l4` but the cluster only has an `a100` worker on
         // the same bundle. We still route (the profile distinction is
         // cosmetic here) rather than forcing a scale-up.
         let reg = pool_registry();
-        reg.update_worker("http://w1:8080", worker_msg("default", "a100", "pool-a"))
+        reg.update_worker("http://w1:8080", worker_msg("default", "a100", "default"))
             .await;
         let out = resolve_effective_pool(&reg, "default", "l4", "").await;
-        assert_eq!(out.resolution, PoolResolution::Pool("pool-a".to_string()));
+        assert_eq!(out.resolution, PoolResolution::Pool("default".to_string()));
         // Exact tuple (default, l4) had no worker — even though we
         // still routed via the bundle-only fallback, the caller must
         // record demand so KEDA scales up the l4 pool.
@@ -3616,10 +3615,13 @@ mod tests {
         // Common default-routing flow: no GPU header, one worker on the
         // requested bundle → route to its pool directly (no 202).
         let reg = pool_registry();
-        reg.update_worker("http://w1:8080", worker_msg("default", "l4-spot", "pool-a"))
-            .await;
+        reg.update_worker(
+            "http://w1:8080",
+            worker_msg("default", "l4-spot", "default"),
+        )
+        .await;
         let out = resolve_effective_pool(&reg, "default", "", "").await;
-        assert_eq!(out.resolution, PoolResolution::Pool("pool-a".to_string()));
+        assert_eq!(out.resolution, PoolResolution::Pool("default".to_string()));
         // No GPU preference → no demand tracking applicable.
         assert!(!out.exact_gpu_match);
     }
@@ -3629,10 +3631,13 @@ mod tests {
         // Exact (bundle, gpu) worker exists → `exact_gpu_match` is
         // `true` and the caller skips the demand-tracking write.
         let reg = pool_registry();
-        reg.update_worker("http://w1:8080", worker_msg("default", "l4-spot", "pool-a"))
-            .await;
+        reg.update_worker(
+            "http://w1:8080",
+            worker_msg("default", "l4-spot", "default"),
+        )
+        .await;
         let out = resolve_effective_pool(&reg, "default", "l4-spot", "").await;
-        assert_eq!(out.resolution, PoolResolution::Pool("pool-a".to_string()));
+        assert_eq!(out.resolution, PoolResolution::Pool("default".to_string()));
         assert!(out.exact_gpu_match);
     }
 

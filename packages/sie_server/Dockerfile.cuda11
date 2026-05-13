@@ -152,6 +152,8 @@ FROM nvidia/cuda:11.8.0-base-ubuntu22.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# libspatialindex-c6: rtree (docling dep) dlopens libspatialindex_c.so; the
+# rtree==1.4.1 wheel only bundles the C++ core, not the C wrapper.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
@@ -159,7 +161,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     gcc \
     libc6-dev \
     libgomp1 \
-    libnuma1
+    libnuma1 \
+    libspatialindex-c6
 
 RUN groupadd -g 1000 sie && useradd -u 1000 -g sie -m sie
 

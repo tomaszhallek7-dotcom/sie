@@ -43,8 +43,13 @@ logger = logging.getLogger(__name__)
 
 _ERR_SERVER_STARTUP = "SGLang server failed to start within timeout"
 
-# Server startup config
-_STARTUP_TIMEOUT_S = 300  # 5 minutes - accounts for HF downloads and model loading
+# Server startup config.
+# 8B+ models can take 5+ min just to download from HF on a fresh cache,
+# plus SGLang itself then loads the model onto the GPU. The default
+# was 300s, which is too tight for nvidia/llama-embed-nemotron-8b
+# and similar. Override via SIE_SGLANG_STARTUP_TIMEOUT_S for hosts
+# with slow network or larger models.
+_STARTUP_TIMEOUT_S = int(os.environ.get("SIE_SGLANG_STARTUP_TIMEOUT_S", "900"))
 _HEALTH_CHECK_INTERVAL_S = 2.0
 _BASE_PORT = 30000  # Starting port for SGLang servers
 

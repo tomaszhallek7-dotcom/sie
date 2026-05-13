@@ -132,7 +132,15 @@ class ExtractParamsModel(BaseModel):
     labels: list[str] | None = Field(default=None, description="Entity labels to extract")
     output_schema: dict[str, Any] | None = Field(default=None, description="Schema for structured extraction")
     instruction: str | None = Field(default=None, description="Task instruction")
-    options: dict[str, Any] | None = Field(default=None, description="Adapter-specific options")
+    options: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Adapter-specific options. Recognized sub-keys include "
+            "'overflow_policy' (one of 'default', 'truncate_text', 'error'; "
+            "default 'default') controlling how inputs exceeding the model's "
+            "max_sequence_length are handled."
+        ),
+    )
 
 
 class ExtractRequestModel(BaseModel):
@@ -147,7 +155,14 @@ class ExtractRequestModel(BaseModel):
                 {
                     "items": [{"text": "Apple Inc. was founded by Steve Jobs in Cupertino, California."}],
                     "params": {"labels": ["person", "organization", "location"]},
-                }
+                },
+                {
+                    "items": [{"text": "Apple Inc. was founded by Steve Jobs in Cupertino, California."}],
+                    "params": {
+                        "labels": ["person", "organization", "location"],
+                        "options": {"overflow_policy": "truncate_text"},
+                    },
+                },
             ]
         }
     }

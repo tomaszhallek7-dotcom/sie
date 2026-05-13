@@ -484,11 +484,11 @@ pub fn record_rejected_request(machine_profile: &str, bundle: &str, reason: &str
         .inc();
 }
 
-/// Clear PENDING_DEMAND for GPU types that now have healthy workers.
+/// Clear PENDING_DEMAND for WorkerGroups that now have healthy workers.
 /// Called when worker metrics are updated to cancel stale demand signals.
 /// Uses the DemandTracker to properly cancel expiry timers when clearing.
 pub fn clear_fulfilled_demand(
-    healthy_gpu_types: &std::collections::HashSet<String>,
+    healthy_worker_groups: &std::collections::HashSet<(String, String)>,
     demand_tracker: &crate::state::demand_tracker::DemandTracker,
 ) {
     // Gather current demand label pairs from the metric
@@ -504,8 +504,8 @@ pub fn clear_fulfilled_demand(
                 .map(|l| (l.get_name(), l.get_value()))
                 .collect();
             if let Some(&gpu) = labels.get("machine_profile") {
-                if healthy_gpu_types.contains(&gpu.to_lowercase()) {
-                    let bundle = labels.get("bundle").copied().unwrap_or("default");
+                let bundle = labels.get("bundle").copied().unwrap_or("default");
+                if healthy_worker_groups.contains(&(gpu.to_lowercase(), bundle.to_lowercase())) {
                     let current = PENDING_DEMAND.with_label_values(&[gpu, bundle]).get();
                     if current > 0.0 {
                         demand_tracker.clear(gpu, bundle);
@@ -849,11 +849,11 @@ mod tests {
             .with_label_values(&["l4-spot", "default"])
             .set(1.0);
 
-        // Healthy workers include l4-spot
-        let mut gpus = std::collections::HashSet::new();
-        gpus.insert("l4-spot".to_string());
+        // Healthy workers include l4-spot/default.
+        let mut worker_groups = std::collections::HashSet::new();
+        worker_groups.insert(("l4-spot".to_string(), "default".to_string()));
 
-        clear_fulfilled_demand(&gpus, &tracker);
+        clear_fulfilled_demand(&worker_groups, &tracker);
 
         let val = PENDING_DEMAND
             .with_label_values(&["l4-spot", "default"])
@@ -874,15 +874,47 @@ mod tests {
             .with_label_values(&["h100", "default"])
             .set(1.0);
 
-        // Only l4-spot is healthy
-        let mut gpus = std::collections::HashSet::new();
-        gpus.insert("l4-spot".to_string());
+        // Only l4-spot/default is healthy.
+        let mut worker_groups = std::collections::HashSet::new();
+        worker_groups.insert(("l4-spot".to_string(), "default".to_string()));
 
-        clear_fulfilled_demand(&gpus, &tracker);
+        clear_fulfilled_demand(&worker_groups, &tracker);
 
         // h100 demand should remain
         let val = PENDING_DEMAND.with_label_values(&["h100", "default"]).get();
         assert!((val - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_clear_fulfilled_demand_preserves_different_bundle() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let _ = &*REGISTRY;
+        reset_test_metrics();
+
+        let tracker = crate::state::demand_tracker::DemandTracker::new();
+
+        // Same machine profile has demand in two bundles.
+        PENDING_DEMAND
+            .with_label_values(&["l4-spot", "default"])
+            .set(1.0);
+        PENDING_DEMAND
+            .with_label_values(&["l4-spot", "sglang"])
+            .set(1.0);
+
+        // A healthy default worker must not clear sglang demand.
+        let mut worker_groups = std::collections::HashSet::new();
+        worker_groups.insert(("l4-spot".to_string(), "default".to_string()));
+
+        clear_fulfilled_demand(&worker_groups, &tracker);
+
+        let default_val = PENDING_DEMAND
+            .with_label_values(&["l4-spot", "default"])
+            .get();
+        let sglang_val = PENDING_DEMAND
+            .with_label_values(&["l4-spot", "sglang"])
+            .get();
+        assert!((default_val - 0.0).abs() < f64::EPSILON);
+        assert!((sglang_val - 1.0).abs() < f64::EPSILON);
     }
 
     // ------------------------------------------------------------------

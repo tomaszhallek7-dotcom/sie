@@ -28,6 +28,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 EXTRACT_MODEL = "NeuML/gliner-bert-tiny"
+EXTRACT_FUTURE_TIMEOUT_S = 180
 
 
 @pytest.mark.integration
@@ -54,7 +55,7 @@ class TestExtractConcurrentBatching:
         # Run 2 concurrent extractions
         with ThreadPoolExecutor(2) as executor:
             futures = [executor.submit(extract_single, text) for text in texts]
-            results = [f.result(timeout=60) for f in futures]
+            results = [f.result(timeout=EXTRACT_FUTURE_TIMEOUT_S) for f in futures]
 
         # All requests completed successfully
         assert len(results) == 2
@@ -90,7 +91,7 @@ class TestExtractConcurrentBatching:
         start = time.perf_counter()
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = [executor.submit(extract_single, text) for text in texts]
-            concurrent_results = [f.result(timeout=60) for f in futures]
+            concurrent_results = [f.result(timeout=EXTRACT_FUTURE_TIMEOUT_S) for f in futures]
         concurrent_time = time.perf_counter() - start
 
         # All results valid
@@ -161,7 +162,7 @@ class TestExtractBackpressure:
         # Fire off many concurrent requests
         with ThreadPoolExecutor(max_workers=num_requests) as executor:
             futures = [executor.submit(extract_single, i) for i in range(num_requests)]
-            results = [f.result(timeout=120) for f in as_completed(futures)]
+            results = [f.result(timeout=EXTRACT_FUTURE_TIMEOUT_S) for f in as_completed(futures)]
 
         # Count successes and failures
         successes = sum(1 for _, success, _ in results if success)

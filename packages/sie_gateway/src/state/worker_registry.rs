@@ -205,6 +205,25 @@ impl WorkerRegistry {
     /// Resolve the NATS pool name for queue mode routing.
     /// Finds a healthy worker matching the bundle (and optionally GPU) that has a pool_name set.
     pub async fn resolve_queue_pool(&self, bundle: &str, gpu: &str) -> Option<String> {
+        self.resolve_queue_pool_matching(bundle, gpu, None)
+    }
+
+    /// Resolve the NATS pool name, constrained to a specific logical pool.
+    pub async fn resolve_queue_pool_in_pool(
+        &self,
+        bundle: &str,
+        gpu: &str,
+        pool_name: &str,
+    ) -> Option<String> {
+        self.resolve_queue_pool_matching(bundle, gpu, Some(pool_name))
+    }
+
+    fn resolve_queue_pool_matching(
+        &self,
+        bundle: &str,
+        gpu: &str,
+        pool_name: Option<&str>,
+    ) -> Option<String> {
         let snap = self.snapshot.load();
 
         // `by_bundle` is keyed with `w.bundle.to_lowercase()` in
@@ -224,6 +243,11 @@ impl WorkerRegistry {
         for w in candidates {
             if w.pool_name.is_empty() {
                 continue;
+            }
+            if let Some(pool_name) = pool_name {
+                if !w.pool_name.eq_ignore_ascii_case(pool_name) {
+                    continue;
+                }
             }
             if !gpu.is_empty() && !w.machine_profile.eq_ignore_ascii_case(gpu) {
                 continue;
@@ -768,6 +792,34 @@ mod tests {
 
         let pool = reg.resolve_queue_pool("default", "l4-spot").await;
         assert_eq!(pool, Some("pool-a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_queue_pool_in_pool_filters_pool_name() {
+        let reg = registry();
+
+        let mut default_msg = make_msg(true);
+        default_msg.pool_name = "default".into();
+        default_msg.bundle = "default".into();
+        default_msg.machine_profile = "l4-spot".into();
+        reg.update_worker("http://w1:8080", default_msg).await;
+
+        let mut isolated_msg = make_msg(true);
+        isolated_msg.name = "worker-2".into();
+        isolated_msg.pool_name = "eval-l4".into();
+        isolated_msg.bundle = "default".into();
+        isolated_msg.machine_profile = "l4-spot".into();
+        reg.update_worker("http://w2:8080", isolated_msg).await;
+
+        let pool = reg
+            .resolve_queue_pool_in_pool("default", "l4-spot", "eval-l4")
+            .await;
+        assert_eq!(pool, Some("eval-l4".to_string()));
+
+        let missing = reg
+            .resolve_queue_pool_in_pool("default", "l4-spot", "missing")
+            .await;
+        assert!(missing.is_none());
     }
 
     #[tokio::test]

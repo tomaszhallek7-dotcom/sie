@@ -9,6 +9,7 @@ import msgspec
 from fastapi import HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
+from sie_server.adapters.errors import InputTooLongError
 from sie_server.api.serialization import MsgPackResponse, _convert_for_json
 from sie_server.core.oom import is_oom_error
 from sie_server.core.timing import RequestTiming
@@ -486,6 +487,17 @@ class InferenceErrorHandler:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
                 "code": ErrorCode.INVALID_INPUT.value,
+                "message": str(error),
+            },
+        )
+
+    def handle_input_too_long(self, error: InputTooLongError) -> HTTPException:
+        self.span.set_attribute("error", "input_too_long")
+        record_request(model=self.model, endpoint=self.endpoint, status="error", **self._log_kwargs())
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": ErrorCode.INPUT_TOO_LONG.value,
                 "message": str(error),
             },
         )

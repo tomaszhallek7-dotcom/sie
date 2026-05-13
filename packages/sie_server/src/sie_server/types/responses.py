@@ -181,6 +181,7 @@ class ErrorCode(StrEnum):
     QUEUE_FULL = "QUEUE_FULL"
     INTERNAL_ERROR = "INTERNAL_ERROR"
     RESOURCE_EXHAUSTED = "RESOURCE_EXHAUSTED"  # GPU OOM
+    INPUT_TOO_LONG = "INPUT_TOO_LONG"
 
 
 class ErrorDetail(TypedDict, total=False):

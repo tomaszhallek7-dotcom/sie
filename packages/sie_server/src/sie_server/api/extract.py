@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Annotated, Any, cast
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
+from sie_server.adapters.errors import InputTooLongError
 from sie_server.api.helpers import (
     InferenceErrorHandler,
     ModelStateChecker,
@@ -367,6 +368,8 @@ async def extract(
             timing = worker_result.timing
         except QueueFullError as e:
             raise error_handler.handle_queue_full(e) from e
+        except InputTooLongError as e:
+            raise error_handler.handle_input_too_long(e) from e
         except ValueError as e:
             raise error_handler.handle_value_error(e) from e
         except Exception as e:

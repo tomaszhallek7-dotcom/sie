@@ -466,6 +466,13 @@ class ModelRegistry:
             msg = _ERR_MODEL_ALREADY_LOADED.format(name=name)
             raise ValueError(msg)
 
+        # Ensure model weights are cached (download from HF / cluster cache
+        # if needed). Kept as a distinct phase from instantiate so the
+        # post-download timeout in ``ModelLoader`` does not cover the
+        # potentially long download — slow networks remain supported via
+        # ``HF_HUB_DOWNLOAD_TIMEOUT`` stall detection only.
+        self._loader.ensure_weights_cached(config)
+
         # Instantiate the adapter with device-aware fallback selection
         adapter = self._loader.instantiate_adapter(name, config, model_dir, device)
 
@@ -489,7 +496,8 @@ class ModelRegistry:
             )
             self.unload(lru_model)
 
-            # Retry once after eviction - need new adapter instance
+            # Retry once after eviction - weights still on disk so we
+            # skip ``ensure_weights_cached`` here.
             adapter = self._loader.instantiate_adapter(name, config, model_dir, device)
             loaded = self._loader.load_and_register(name, device, adapter, config)
 
@@ -566,7 +574,14 @@ class ModelRegistry:
                 config = self._configs[name]
                 model_dir = self._model_dirs.get(name, Path())
 
-                # Instantiate adapter (in thread pool) with device-aware fallback selection
+                # Ensure weights are cached BEFORE instantiation. This
+                # phase is intentionally unbounded by the post-download
+                # timeout in ``ModelLoader`` — slow user networks are
+                # supported via ``HF_HUB_DOWNLOAD_TIMEOUT`` stall
+                # detection inside ``huggingface_hub`` only.
+                await self._loader.ensure_weights_cached_async(name, config)
+
+                # Instantiate adapter (in thread pool, post-download timeout applies)
                 adapter = await self._loader.instantiate_adapter_async(name, config, model_dir, device)
 
                 try:
@@ -589,7 +604,8 @@ class ModelRegistry:
                     )
                     await self._do_unload(lru_model)
 
-                    # Retry once after eviction - need new adapter instance
+                    # Retry once after eviction. Weights are still cached
+                    # on disk so we skip ``ensure_weights_cached_async``.
                     adapter = await self._loader.instantiate_adapter_async(name, config, model_dir, device)
                     loaded = await self._loader.load_and_register_async(name, device, adapter, config)
 

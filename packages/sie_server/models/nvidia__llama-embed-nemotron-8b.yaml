@@ -18,10 +18,19 @@ profiles:
   default:
     max_batch_tokens: 8192
     compute_precision: bfloat16
-    adapter_path: sie_server.adapters.sglang:SGLangEmbeddingAdapter
+    # Was sie_server.adapters.sglang:SGLangEmbeddingAdapter, but
+    # SGLang's generic transformers fallback hits
+    # `assert get_embedding is False` for this Llama-based arch
+    # (no model-specific embedding implementation registered). Route
+    # through PyTorchEmbeddingAdapter like NV-Embed-v2 (also Llama-
+    # based 7B+ embedder); the heavy lane has 96 GiB so non-paged
+    # attention is fine. May be reconciled with a colleague's
+    # in-flight SGLang/arch fix later.
+    adapter_path: sie_server.adapters.pytorch_embedding:PyTorchEmbeddingAdapter
     adapter_options:
       loadtime:
-        mem_fraction_static: 0.85
+        trust_remote_code: true
+        attn_implementation: eager
       runtime:
         pooling: last_token
         normalize: true

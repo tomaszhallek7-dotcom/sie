@@ -13,6 +13,7 @@ Performance note (Dec 2025):
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -21,11 +22,14 @@ import torch
 from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
+from sie_server.adapters.errors import InputTooLongError
 from sie_server.core.inference_output import ExtractOutput
+from sie_server.types.overflow_policy import DEFAULT_OVERFLOW_POLICY, OverflowPolicy
 from sie_server.types.responses import Classification
 
 if TYPE_CHECKING:
     from gliclass import ZeroShotClassificationPipeline  # ty:ignore[unresolved-import]
+    from transformers import PreTrainedTokenizerBase  # ty:ignore[unresolved-import]
 
     from sie_server.types.inputs import Item
 
@@ -35,7 +39,11 @@ _ERR_INPUT_TOO_LONG = (
     "this typically indicates the input exceeds the model's max sequence length "
     "even after truncation. Reduce input length or split into chunks."
 )
-
+# Matches the torch IndexError shape "index N is out of bounds for dimension D
+# with size 0" emitted when gliclass indexes into an empty post-processing
+# tensor on overflowing inputs. ``\b`` anchors the size to a word boundary so a
+# hypothetical "with size 02" cannot falsely match.
+_INDEX_OOB_EMPTY_TENSOR_RE = re.compile(r"out of bounds for dimension \d+ with size 0\b")
 ClassificationType = Literal["single-label", "multi-label"]
 
 
@@ -52,12 +60,8 @@ class GLiClassAdapter(BaseAdapter):
     spec: ClassVar[AdapterSpec] = AdapterSpec(
         inputs=("text",),
         outputs=("json",),
-        unload_fields=("_pipeline",),
+        unload_fields=("_pipeline", "_tokenizer"),
     )
-
-    def _check_loaded(self) -> None:
-        if self._pipeline is None:
-            raise RuntimeError(ERR_NOT_LOADED)
 
     def __init__(
         self,
@@ -91,6 +95,8 @@ class GLiClassAdapter(BaseAdapter):
         self._compute_precision = compute_precision
 
         self._pipeline: ZeroShotClassificationPipeline | None = None
+        self._tokenizer: PreTrainedTokenizerBase | None = None
+        self._special_count: int = 0
         self._device: str | None = None
 
     def load(self, device: str) -> None:
@@ -117,12 +123,12 @@ class GLiClassAdapter(BaseAdapter):
         # Load model and tokenizer
         model = GLiClassModel.from_pretrained(self._model_name_or_path)
         model = model.to(device, dtype=torch_dtype)
-        tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path)
+        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path)
 
         # Bound the tokenizer's max length so any internal tokenization in the
         # gliclass library auto-truncates to the model's actual capacity.
         if self._max_seq_length is not None:
-            tokenizer.model_max_length = self._max_seq_length
+            self._tokenizer.model_max_length = self._max_seq_length
 
         # Create pipeline. Pass max_length explicitly so the pipeline's
         # ``tokenizer(..., truncation=True, max_length=self.max_length)`` calls
@@ -132,31 +138,85 @@ class GLiClassAdapter(BaseAdapter):
         # long inputs (see sie-test#88, sie-test#89).
         pipeline_kwargs: dict[str, Any] = {
             "model": model,
-            "tokenizer": tokenizer,
+            "tokenizer": self._tokenizer,
             "classification_type": self._classification_type,
             "device": device,
         }
         if self._max_seq_length is not None:
             pipeline_kwargs["max_length"] = self._max_seq_length
 
+        self._special_count = int(self._tokenizer.num_special_tokens_to_add(pair=False))
         self._pipeline = ZeroShotClassificationPipeline(**pipeline_kwargs)
 
     def _extract_text(self, item: Item) -> str:
-        """Extract text from an item.
-
-        Args:
-            item: Input item with text field.
-
-        Returns:
-            Text string.
-
-        Raises:
-            ValueError: If item has no text.
-        """
         if not item.text:
             msg = "Item must have text for classification"
             raise ValueError(msg)
         return item.text
+
+    def _apply_overflow_policy(
+        self,
+        texts: list[str],
+        labels: list[str],
+        policy: OverflowPolicy = DEFAULT_OVERFLOW_POLICY,
+    ) -> list[str]:
+        """Enforce overflow_policy by pre-tokenizing text and label_prompt separately.
+
+        At inference the gliclass pipeline tokenizes the fused string with
+        ``add_special_tokens=True``, so the model sees
+        ``observed = text_tokens + label_prompt_tokens + special_count``, where
+        ``special_count`` is the BERT-style ``[CLS]``/``[SEP]`` wrap (2 for all
+        current gliclass models). We recover the same total without running the
+        model by tokenizing each part with ``add_special_tokens=False``.
+
+        On overflow:
+        - ``default`` returns texts unchanged (upstream as-is — may crash inside
+          the pipeline; the ``c0ce823c`` ``try/except`` in ``extract`` is the
+          defense-in-depth backstop).
+        - ``error`` raises ``InputTooLongError`` (whole batch fails, no partial
+          responses).
+        - ``truncate_text`` slices text to
+          ``budget = max_sequence_length - label_prompt_tokens - special_count``.
+
+        Under ``truncate_text`` and ``error``, ``label_prompt`` alone exceeding
+        the cap always raises.
+        """
+        if policy == "default":
+            return texts
+
+        if self._pipeline is None:
+            raise RuntimeError(ERR_NOT_LOADED)
+        if self._tokenizer is None:
+            raise RuntimeError(ERR_NOT_LOADED)
+        if self._max_seq_length is None:
+            raise RuntimeError(ERR_NOT_LOADED)
+
+        label_prompt = self._pipeline.pipe.prepare_input(text="", labels=labels)  # ty:ignore[unresolved-attribute]
+        label_prompt_tokens = len(self._tokenizer(label_prompt, add_special_tokens=False)["input_ids"])
+        overhead = label_prompt_tokens + self._special_count
+        budget = self._max_seq_length - overhead
+
+        if budget <= 0:
+            raise InputTooLongError(
+                f"label_prompt ({label_prompt_tokens} tokens) + special ({self._special_count}) "
+                f"exceeds max_sequence_length ({self._max_seq_length}); reduce the number or length of labels"
+            )
+
+        new_texts: list[str] = []
+        for i, text in enumerate(texts):
+            text_ids = self._tokenizer(text, add_special_tokens=False)["input_ids"]
+            text_tokens = len(text_ids)
+            observed = text_tokens + overhead
+            if observed <= self._max_seq_length:
+                new_texts.append(text)
+                continue
+            if policy == "error":
+                raise InputTooLongError(
+                    f"items[{i}] observed_tokens={observed} exceeds max_sequence_length ({self._max_seq_length}) "
+                    f"(text={text_tokens}, label_prompt={label_prompt_tokens}, special={self._special_count})"
+                )
+            new_texts.append(self._tokenizer.decode(text_ids[:budget], skip_special_tokens=True))
+        return new_texts
 
     def extract(
         self,
@@ -193,7 +253,6 @@ class GLiClassAdapter(BaseAdapter):
             ValueError: If labels not provided or items lack text, or if the
                 input produced an empty tensor inside the gliclass pipeline.
         """
-        self._check_loaded()
         if self._pipeline is None:
             raise RuntimeError(ERR_NOT_LOADED)
 
@@ -209,6 +268,9 @@ class GLiClassAdapter(BaseAdapter):
         opts = options or {}
         effective_threshold = float(opts.get("threshold", self._threshold))
 
+        overflow_policy = opts.get("overflow_policy", DEFAULT_OVERFLOW_POLICY)
+        texts = self._apply_overflow_policy(texts, labels, overflow_policy)
+
         # Run batch classification.
         # - threshold=0.0: never let the gliclass library drop labels for us
         #   (in single-label mode the lib returns only argmax anyway, so we
@@ -223,15 +285,22 @@ class GLiClassAdapter(BaseAdapter):
                     threshold=0.0,
                     return_hierarchical=True,
                 )
-        except RuntimeError as exc:
-            # The gliclass library calls torch.argmax on potentially-empty
-            # tensors when inputs blow past the model's position-embedding
-            # capacity. Surface this as a clear validation error rather than a
-            # 500 INFERENCE_ERROR. Match on BOTH phrases to avoid catching
-            # unrelated runtime errors.
+        except (RuntimeError, IndexError) as exc:
+            # The gliclass library crashes inside the pipeline when inputs exceed
+            # the model's position-embedding capacity, producing empty intermediate
+            # tensors that downstream ops then operate on. Surface the known crash
+            # signatures as InputTooLongError (validation) instead of leaking as
+            # 500 INFERENCE_ERROR. Match must be specific to avoid swallowing
+            # unrelated errors. Catalog of caught signatures:
+            #   - RuntimeError "argmax(): ... numel() == 0"  (sie-test#89 / #848)
+            #     torch.argmax on an empty tensor inside the classification head.
+            #   - IndexError  "index N is out of bounds for dimension D with size 0" (#860)
+            #     indexing an empty tensor in the gliclass post-processing path.
             msg = str(exc)
-            if "numel() == 0" in msg and "argmax" in msg:
-                raise ValueError(_ERR_INPUT_TOO_LONG) from exc
+            if isinstance(exc, RuntimeError) and "numel() == 0" in msg and "argmax" in msg:
+                raise InputTooLongError(_ERR_INPUT_TOO_LONG) from exc
+            if isinstance(exc, IndexError) and _INDEX_OOB_EMPTY_TENSOR_RE.search(msg):
+                raise InputTooLongError(_ERR_INPUT_TOO_LONG) from exc
             raise
 
         all_classifications: list[list[Classification]] = []

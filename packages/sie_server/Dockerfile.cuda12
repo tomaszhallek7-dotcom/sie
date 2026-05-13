@@ -173,6 +173,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 # libnuma1: required by sgl_kernel (SGLang bundle); import fails with a
 #   misleading SM-arch error without it.
 # libgomp1: torch OpenMP runtime.
+# libspatialindex-c6: rtree (docling dep) dlopens libspatialindex_c.so; the
+#   rtree==1.4.1 wheel only bundles the C++ core, not the C wrapper.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
@@ -180,7 +182,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     gcc \
     libc6-dev \
     libgomp1 \
-    libnuma1
+    libnuma1 \
+    libspatialindex-c6
 
 RUN groupadd -g 1000 sie && useradd -u 1000 -g sie -m sie
 

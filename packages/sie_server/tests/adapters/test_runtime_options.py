@@ -933,6 +933,27 @@ class TestExtractRuntimeOptions:
         with pytest.raises(ValueError, match="empty tensor"):
             adapter.extract([Item(text="x" * 6000)], labels=["Electronics"])
 
+    def test_gliclass_translates_index_oob_crash_to_validation_error(self) -> None:
+        """The ``IndexError: index ... out of bounds ... size 0`` crash from the
+        gliclass post-processing path on overflowing inputs is surfaced as
+        ValueError (validation), not IndexError (500 INFERENCE_ERROR).
+
+        Regression for #860 — observed on a ~2.5 KB repeated-sentence request to
+        ``knowledgator/gliclass-large-v1.0`` under ``overflow_policy=default``.
+        """
+        from unittest.mock import MagicMock
+
+        from sie_server.adapters.gliclass import GLiClassAdapter
+
+        adapter = GLiClassAdapter("test-model")
+        mock_pipeline = MagicMock()
+        mock_pipeline.side_effect = IndexError("index 0 is out of bounds for dimension 0 with size 0")
+        adapter._pipeline = mock_pipeline
+        adapter._device = "cpu"
+
+        with pytest.raises(ValueError, match="empty tensor"):
+            adapter.extract([Item(text="x" * 6000)], labels=["Electronics"])
+
     def test_gliclass_unrelated_runtime_error_propagates(self) -> None:
         """RuntimeErrors that are not the specific empty-tensor argmax crash
         must propagate untouched (so genuine bugs surface as 500s instead of
@@ -954,6 +975,19 @@ class TestExtractRuntimeOptions:
         # Also: a RuntimeError mentioning argmax but NOT numel must propagate.
         mock_pipeline.side_effect = RuntimeError("argmax() got an unexpected keyword argument")
         with pytest.raises(RuntimeError, match="argmax"):
+            adapter.extract([Item(text="hello")], labels=["a", "b"])
+
+        # Also: an IndexError with "out of bounds" but NOT "size 0" must propagate
+        # (e.g. a real out-of-range index against a non-empty tensor).
+        mock_pipeline.side_effect = IndexError("index 5 is out of bounds for dimension 0 with size 3")
+        with pytest.raises(IndexError, match="size 3"):
+            adapter.extract([Item(text="hello")], labels=["a", "b"])
+
+        # Also: an IndexError mentioning "size 0" but NOT "out of bounds for
+        # dimension ... with size 0" must propagate — locks in the full
+        # "out of bounds for dimension D with size 0" discriminator.
+        mock_pipeline.side_effect = IndexError("some unrelated error with size 0 buried in the message")
+        with pytest.raises(IndexError, match="unrelated"):
             adapter.extract([Item(text="hello")], labels=["a", "b"])
 
     def test_gliclass_long_input_does_not_crash(self) -> None:

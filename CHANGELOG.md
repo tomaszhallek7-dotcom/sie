@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.3.3
+
+- chore(main): release 0.3.3
+- fix(docker): install libspatialindex-c6 in worker images
+- refactor(gliclass): tighten IndexError discriminator with regex
+- fix(gliclass): catch IndexError empty-tensor crash as InputTooLongError
+- test(gliclass): cover _apply_overflow_policy per policy
+- fix(gliclass): raise InputTooLongError from argmax-empty backstop
+- chore(openapi): update openapi spec
+- Fix gateway routing and autoscaling regressions
+- Address Tilt PR review feedback
+- Optimize gateway msgpack success responses
+- Add kind Tilt gateway SDK E2E loop
+- refactor(server): give overflow_policy a typed home
+- test(adaptive-batching): add absolute tolerance to floating-point assertions
+- docs(gliclass): document token accounting in _apply_overflow_policy
+- chore(gliclass): refactoring
+- chore(gliclass): remove redundant docstring _extract_text
+- chore(gliclass): remove redundant "loaded" checks
+- feat(server): enforce overflow_policy in gliclass adapter
+- feat(server): validate overflow_policy in resolve_runtime_options
+- docs(server): surface overflow_policy in extract OpenAPI schema
+- feat(server): route INPUT_TOO_LONG to HTTP 400 in extract API
+- feat(server): add new INPUT_TOO_LONG ErrorCode
+- feat(model-loader): add post-download load timeout with stall-based download bounds
+- fix(ci): peft-adapter base size + ocr force-heavy + drop hf_hub cap
+- fix(bundles): cap huggingface-hub <0.32 in transformers5 bundle
+- fix(ci): drop runner_class from public model YAMLs; route via HF size
+- feat(ci): two GPU lanes (L4 + g7e) with model-driven routing
+- fix(sglang): make startup timeout env-driven; bump default 300 -> 900
+- fix(adapters): preserve encode order/boundaries (colqwen3) + lock v1 to_dict patch (nemo_colembed)
+- fix(nemo_colembed): strip zero-padded rows from v2 batched embeddings
+- fix(nemo_colembed): broaden AutoModel-failure catch for v1 fallback
+- feat(adapters): add ColQwen3 and Nemotron ColEmbed v2 visual document retrieval
+
 ## v0.3.2
 
 - chore(main): release 0.3.2

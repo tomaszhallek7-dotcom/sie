@@ -114,13 +114,20 @@ pub(crate) async fn metrics_handler(
         .collect();
     metrics::update_worker_metrics(&snapshots);
 
-    // Clear PENDING_DEMAND for GPUs that now have healthy workers
-    let healthy_gpus: std::collections::HashSet<String> = snapshots
+    // Clear PENDING_DEMAND only for WorkerGroups that now have healthy workers.
+    let healthy_worker_groups: std::collections::HashSet<(String, String)> = snapshots
         .iter()
         .filter(|w| w.healthy && !w.machine_profile.is_empty())
-        .map(|w| w.machine_profile.to_lowercase())
+        .map(|w| {
+            let bundle = if w.bundle.is_empty() {
+                "default"
+            } else {
+                w.bundle.as_str()
+            };
+            (w.machine_profile.to_lowercase(), bundle.to_lowercase())
+        })
         .collect();
-    metrics::clear_fulfilled_demand(&healthy_gpus, &state.demand_tracker);
+    metrics::clear_fulfilled_demand(&healthy_worker_groups, &state.demand_tracker);
 
     let model_workers = state.registry.get_models().await;
     let model_counts: std::collections::HashMap<String, usize> = model_workers
