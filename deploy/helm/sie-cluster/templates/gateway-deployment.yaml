@@ -32,9 +32,14 @@
 {{- if not .Values.nats.config.jetstream.enabled }}
   {{- fail "clusterRouting=queue requires nats.config.jetstream.enabled=true" }}
 {{- end }}
-{{- if .Values.payloadStore.enabled }}
-  {{- if not (or (hasPrefix "s3://" (default "" .Values.payloadStore.url)) (hasPrefix "gs://" (default "" .Values.payloadStore.url))) }}
-    {{- fail "payloadStore.url must be an object-store URL (s3://bucket/prefix or gs://bucket/prefix), not a local path" }}
+{{- /* Resolve the effective payload-store URL once (helper applies the
+     auto-derivation: explicit url > clusterCache.url + /payloads > empty).
+     The chart treats a non-empty resolved URL as "payload store enabled"
+     and rejects local paths so misconfigured queue clusters fail fast. */}}
+{{- $payloadStoreUrl := include "sie-cluster.payloadStoreUrl" . }}
+{{- if $payloadStoreUrl }}
+  {{- if not (or (hasPrefix "s3://" $payloadStoreUrl) (hasPrefix "gs://" $payloadStoreUrl)) }}
+    {{- fail (printf "payloadStore.url must be an object-store URL (s3://bucket/prefix or gs://bucket/prefix), not a local path; got %q" $payloadStoreUrl) }}
   {{- end }}
 {{- end }}
 apiVersion: apps/v1
@@ -60,6 +65,50 @@ spec:
     spec:
       {{- include "sie-cluster.imagePullSecrets" . | nindent 6 }}
       serviceAccountName: {{ include "sie-cluster.serviceAccountName" . }}
+      {{- if and .Values.config.enabled .Values.gateway.waitForConfig.enabled }}
+      # Gate the gateway on sie-config readiness before its cold-start
+      # bootstrap fires. Without this, during a rolling chart upgrade the
+      # gateway pod can come up against the OLD sie-config revision, cache
+      # its export, and then later hit an append-only conflict when the
+      # NEW sie-config publishes the same model with a changed profile
+      # config. The init container loops on sie-config's /readyz so that
+      # by the time the gateway boots, the control plane is the new
+      # revision. The gateway's own bootstrap path (
+      # state::config_bootstrap::add_model_config_authoritative) survives
+      # the race even when this gate is bypassed; this is defense in depth.
+      initContainers:
+        - name: wait-for-sie-config
+          image: {{ .Values.gateway.waitForConfig.image | default "busybox:1.37.0" | quote }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SIE_CONFIG_READYZ_URL
+              value: "http://{{ include "sie-cluster.config.serviceName" . }}:{{ .Values.config.service.port | default 8080 }}/readyz"
+            - name: SIE_CONFIG_WAIT_TIMEOUT_SECONDS
+              value: {{ .Values.gateway.waitForConfig.timeoutSeconds | default 300 | quote }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              deadline=$(( $(date +%s) + SIE_CONFIG_WAIT_TIMEOUT_SECONDS ))
+              echo "waiting on ${SIE_CONFIG_READYZ_URL} (timeout ${SIE_CONFIG_WAIT_TIMEOUT_SECONDS}s)"
+              while [ "$(date +%s)" -lt "$deadline" ]; do
+                if wget -q -O /dev/null --spider "${SIE_CONFIG_READYZ_URL}"; then
+                  echo "sie-config is ready"
+                  exit 0
+                fi
+                sleep 2
+              done
+              echo "timed out waiting for sie-config readyz" >&2
+              exit 1
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+      {{- end }}
       containers:
         - name: gateway
           image: {{ include "sie-cluster.gateway.image" . }}
@@ -129,9 +178,9 @@ spec:
                   key: {{ .Values.config.auth.adminTokenSecretKey }}
             {{- end }}
             {{- end }}
-            {{- if .Values.payloadStore.enabled }}
+            {{- if $payloadStoreUrl }}
             - name: SIE_PAYLOAD_STORE_URL
-              value: {{ .Values.payloadStore.url | quote }}
+              value: {{ $payloadStoreUrl | quote }}
             - name: SIE_PAYLOAD_STORE_TTL
               value: {{ .Values.payloadStore.ttlSeconds | quote }}
             {{- end }}

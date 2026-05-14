@@ -1034,6 +1034,48 @@ describe("SIEClient.extract() - NER", () => {
     expect(parsed.params?.threshold).toBe(0.8);
   });
 
+  it("should forward adapterOptions as params.options on the wire", async () => {
+    // User scenario: "I want to pass overflow_policy to a gliclass model"
+    mockFetch.mockResolvedValueOnce(
+      createMsgpackResponse({
+        items: [{ entities: [] }],
+      }),
+    );
+
+    await client.extract(
+      "knowledgator/gliclass-small-v1.0",
+      { text: "test" },
+      {
+        labels: ["positive", "negative"],
+        adapterOptions: { overflow_policy: "error" },
+      },
+    );
+
+    const fetchCall = mockFetch.mock.calls[0];
+    const body = fetchCall?.[1]?.body as Uint8Array;
+    const parsed = unpackMessage<{
+      params?: { options?: Record<string, unknown> };
+    }>(body);
+
+    expect(parsed.params?.options).toEqual({ overflow_policy: "error" });
+  });
+
+  it("should omit params.options when adapterOptions is not provided", async () => {
+    mockFetch.mockResolvedValueOnce(
+      createMsgpackResponse({
+        items: [{ entities: [] }],
+      }),
+    );
+
+    await client.extract("gliner-multi-v2.1", { text: "test" }, { labels: ["person"] });
+
+    const fetchCall = mockFetch.mock.calls[0];
+    const body = fetchCall?.[1]?.body as Uint8Array;
+    const parsed = unpackMessage<{ params?: Record<string, unknown> }>(body);
+
+    expect(parsed.params).not.toHaveProperty("options");
+  });
+
   it("should return entity positions for highlighting", async () => {
     // User scenario: "I want to highlight entities in my UI"
     mockFetch.mockResolvedValueOnce(

@@ -181,6 +181,33 @@ class ModelLoadFailedError(ServerError):
         self.attempts = attempts
 
 
+class InputTooLongError(RequestError):
+    """Error when the request input exceeds the model's maximum token capacity.
+
+    Raised when the server returns HTTP ``400 INPUT_TOO_LONG`` for an
+    extraction request. Distinct from generic ``RequestError`` so callers
+    can branch on token-budget failures specifically (e.g. truncate the
+    input client-side, switch to a longer-context model, or surface a
+    targeted error to the end user) without parsing the error code.
+
+    Subclass of :class:`RequestError` so existing 4xx handlers continue
+    to work; new code can catch :class:`InputTooLongError` for tailored
+    handling.
+
+    Attributes:
+        model: The model that was requested.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        model: str | None = None,
+    ) -> None:
+        super().__init__(message, code="INPUT_TOO_LONG", status_code=400)
+        self.model = model
+
+
 class ResourceExhaustedError(ServerError):
     """Error when the server has exhausted its OOM-recovery strategies.
 

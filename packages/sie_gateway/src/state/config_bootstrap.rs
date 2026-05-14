@@ -17,8 +17,17 @@
 //!    matches `sie-config`'s view.
 //!
 //! Live updates after bootstrap arrive via NATS deltas
-//! (`sie.config.models.*`), which the `NatsManager` feeds into the same
-//! `ModelRegistry::add_model_config` path used here.
+//! (`sie.config.models.*`), which the `NatsManager` feeds into
+//! `ModelRegistry::add_model_config` (append-only: a profile that already
+//! exists with a different `CanonicalProfile` is rejected, so single-epoch
+//! duplicate publishes are caught). The bootstrap and epoch-poller
+//! catch-up paths here use the parallel `add_model_config_authoritative`
+//! entry point instead, which overrides any conflicting profile and logs
+//! a `warn!`. This is required so that a control-plane schema change
+//! between the gateway's cold-start fetch (against an old `sie-config`
+//! revision) and the next poll tick (after `sie-config` has rolled to a
+//! new revision) doesn't lock the registry into a stale, unrecoverable
+//! state.
 //!
 //! Failure handling:
 //!
@@ -190,8 +199,11 @@ pub struct BootstrapClient {
 /// Outcome of a single `BootstrapClient::bootstrap` call.
 ///
 /// `epoch` is whatever `sie-config` reported in the snapshot envelope.
-/// `applied` counts configs that produced at least one new profile;
-/// no-op replays (everything already matches) are not counted.
+/// `applied` counts configs the registry accepted: new entries, profiles
+/// the authoritative path overrode, and no-op replays where everything
+/// already matched all count. The shared meaning is "this export entry is
+/// reconciled against the current registry state", which is what the
+/// epoch-advance gate needs.
 /// `failed` counts configs that could not be parsed or whose apply
 /// returned a registry-level error. `total` is the size of the incoming
 /// `models` list. `bootstrap_once` refuses to advance `ConfigEpoch` when
@@ -389,12 +401,23 @@ impl BootstrapClient {
         let mut failed = 0usize;
         for model in snapshot.models {
             match parse_exported_model(&model) {
-                Ok(Some(config)) => match registry.add_model_config(config) {
-                    Ok((created, _, _)) if !created.is_empty() => {
-                        applied += 1;
-                    }
+                // Bootstrap uses the AUTHORITATIVE apply path: when an
+                // existing profile config diverges from the export, the
+                // registry overrides the stored config (with a warn log)
+                // instead of returning an append-only conflict. The append-
+                // only invariant is still enforced on the NATS pub/sub
+                // delta path in `nats::manager::NatsManager`, so within a
+                // single epoch duplicate publishes are still caught. See
+                // `ModelRegistry::add_model_config_authoritative`.
+                Ok(Some(config)) => match registry.add_model_config_authoritative(config) {
                     Ok(_) => {
-                        tracing::debug!(model = %model.model_id, "export entry already current");
+                        // Count any Ok as applied: created, overridden, or
+                        // pure no-op replay all mean "registry accepted the
+                        // entry against the current bundle/adapter set". A
+                        // no-op replay still confirms the entry is current,
+                        // which is what `applied == total` is meant to
+                        // signal to the epoch-advance gate.
+                        applied += 1;
                     }
                     Err(e) => {
                         warn!(

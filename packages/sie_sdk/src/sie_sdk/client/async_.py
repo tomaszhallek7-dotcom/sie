@@ -86,6 +86,7 @@ from ._shared import (
     parse_extract_results,
     parse_gpu_param,
     parse_score_result,
+    raise_if_input_too_long,
     raise_if_model_load_failed,
 )
 from .errors import (
@@ -1787,6 +1788,9 @@ class SIEAsyncClient:
 
             # Short-circuit terminal load failures (sie-test#85).
             raise_if_model_load_failed(response, model=model)
+
+            # Short-circuit token-budget overruns (#849).
+            raise_if_input_too_long(response, model=model)
 
             # Handle 503 with MODEL_LOADING - auto-retry
             if response.status_code == 503:

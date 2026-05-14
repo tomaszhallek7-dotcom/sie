@@ -593,6 +593,45 @@ impl ModelRegistry {
     }
 
     pub fn add_model_config(&self, config: ModelConfig) -> Result<AddModelConfigOutcome, String> {
+        self.add_model_config_inner(config, false)
+    }
+
+    /// Like `add_model_config`, but treats the caller as the authoritative
+    /// view of the current epoch: when a profile already exists with a
+    /// different `CanonicalProfile`, the stored config is **overwritten**
+    /// with a `warn!` log instead of returning an append-only conflict
+    /// error.
+    ///
+    /// This is the path the cold-start bootstrap (`state::config_bootstrap`)
+    /// and the epoch poller's catch-up re-export use. The append-only
+    /// invariant on the NATS pub/sub delta path
+    /// (`nats::manager::NatsManager::apply_notification`) is still enforced
+    /// via the plain `add_model_config`, so single-epoch duplicate publishes
+    /// are still caught.
+    ///
+    /// Why: `sie-config` is the source of truth for the current epoch. If
+    /// the gateway pod started against an old `sie-config` revision and
+    /// cached a stale profile config (e.g. v0.3.2 had nemotron-8b on
+    /// `sglang`), and `sie-config` then rolled to a new revision that
+    /// changed that same profile (e.g. v0.3.3 swapped it for
+    /// `pytorch_embedding`), the next bootstrap re-fetch hits the
+    /// append-only check and the entire export refuses to apply (failed=1
+    /// blocks epoch advance), the poller retries forever, and routing wedges
+    /// for every model. The authoritative path heals that on the next poll
+    /// tick by accepting the new config as the latest word from the control
+    /// plane.
+    pub fn add_model_config_authoritative(
+        &self,
+        config: ModelConfig,
+    ) -> Result<AddModelConfigOutcome, String> {
+        self.add_model_config_inner(config, true)
+    }
+
+    fn add_model_config_inner(
+        &self,
+        config: ModelConfig,
+        authoritative: bool,
+    ) -> Result<AddModelConfigOutcome, String> {
         // Serialize mutators. `ArcSwap` gives us lock-free reads but no CAS
         // on the write path — without this lock, two concurrent callers can
         // both `load()` the same base snapshot, both build a derived copy
@@ -652,18 +691,45 @@ impl ModelRegistry {
 
         let mut created_profiles: Vec<String> = Vec::new();
         let mut skipped_profiles: Vec<String> = Vec::new();
+        let mut overridden_profiles: Vec<String> = Vec::new();
 
         if let Some(existing) = snap.models.get_mut(sie_id) {
-            // Append-only: add new profiles, skip identical, reject conflicts
+            // Append-only by default: add new profiles, skip identical,
+            // reject conflicts. When `authoritative` is true (bootstrap /
+            // epoch-poll catch-up), a conflicting profile is OVERWRITTEN
+            // with a warn so the control plane's latest word wins.
             for (profile_name, profile) in &config.profiles {
                 if existing.profile_names.contains(profile_name) {
                     let incoming = CanonicalProfile::from_profile(profile);
                     if let Some(stored) = existing.profile_configs.get(profile_name) {
                         if stored != &incoming {
-                            return Err(format!(
-                                "Profile '{}' on model '{}' already exists with different config (append-only)",
-                                profile_name, sie_id
-                            ));
+                            if !authoritative {
+                                return Err(format!(
+                                    "Profile '{}' on model '{}' already exists with different config (append-only)",
+                                    profile_name, sie_id
+                                ));
+                            }
+                            warn!(
+                                model = %sie_id,
+                                profile = %profile_name,
+                                old_adapter_path = ?stored.adapter_path,
+                                new_adapter_path = ?incoming.adapter_path,
+                                old_max_batch_tokens = ?stored.max_batch_tokens,
+                                new_max_batch_tokens = ?incoming.max_batch_tokens,
+                                old_compute_precision = ?stored.compute_precision,
+                                new_compute_precision = ?incoming.compute_precision,
+                                "overriding existing profile config from authoritative source (sie-config); \
+                                 likely a control-plane schema change between bootstrap and catch-up",
+                            );
+                            overridden_profiles.push(profile_name.clone());
+                            if let Some(ref adapter_path) = profile.adapter_path {
+                                if !adapter_path.is_empty() {
+                                    let module =
+                                        adapter_path.split(':').next().unwrap_or(adapter_path);
+                                    existing.adapter_modules.insert(module.to_string());
+                                }
+                            }
+                            continue;
                         }
                     }
                     skipped_profiles.push(profile_name.clone());
@@ -680,6 +746,14 @@ impl ModelRegistry {
 
             for pname in &created_profiles {
                 existing.profile_names.insert(pname.clone());
+                if let Some(profile) = config.profiles.get(pname) {
+                    existing
+                        .profile_configs
+                        .insert(pname.clone(), CanonicalProfile::from_profile(profile));
+                }
+            }
+            // Authoritative overrides: replace the stored CanonicalProfile.
+            for pname in &overridden_profiles {
                 if let Some(profile) = config.profiles.get(pname) {
                     existing
                         .profile_configs
@@ -758,6 +832,7 @@ impl ModelRegistry {
             model = %sie_id,
             created = ?created_profiles,
             skipped = ?skipped_profiles,
+            overridden = ?overridden_profiles,
             bundles = ?affected_bundles,
             "added model config"
         );
@@ -1307,6 +1382,135 @@ encode:
         assert_eq!(refreshed.info_extras.outputs, vec!["dense"]);
         assert_eq!(refreshed.info_extras.dims["dense"], 384);
         assert_eq!(refreshed.info_extras.max_sequence_length, Some(512));
+    }
+
+    /// Helper for the authoritative-override and append-only-conflict tests:
+    /// returns a `ModelConfig` for `test/model` with a single `default`
+    /// profile pointing at `adapter_path` and a fixed `max_batch_tokens`.
+    fn cfg_for_test_model(adapter_path: &str, max_batch_tokens: u32) -> ModelConfig {
+        ModelConfig {
+            name: "test/model".to_string(),
+            adapter_module: None,
+            default_bundle: None,
+            profiles: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "default".to_string(),
+                    crate::types::model::ProfileConfig {
+                        adapter_path: Some(adapter_path.to_string()),
+                        max_batch_tokens: Some(max_batch_tokens),
+                        compute_precision: None,
+                        adapter_options: None,
+                        extends: None,
+                    },
+                );
+                m
+            },
+            inputs: None,
+            max_sequence_length: None,
+            tasks: None,
+        }
+    }
+
+    /// The append-only `add_model_config` path is what the NATS pub/sub
+    /// delta consumer uses. Single-epoch duplicate publishes must still be
+    /// rejected, otherwise a malformed re-publish could silently overwrite
+    /// the registered config. Locks the existing behavior in place so
+    /// future changes do not regress it.
+    #[test]
+    fn test_add_model_config_append_only_rejects_conflict() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            r#"
+name: default
+priority: 10
+adapters:
+  - sie_server.adapters.sentence_transformer
+  - sie_server.adapters.pytorch_embedding
+"#,
+        )
+        .unwrap();
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        registry
+            .add_model_config(cfg_for_test_model(
+                "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter",
+                4096,
+            ))
+            .expect("first apply seeds the registry");
+
+        // Same sie_id and profile, different adapter_path: conflict.
+        let err = registry
+            .add_model_config(cfg_for_test_model(
+                "sie_server.adapters.pytorch_embedding:PyTorchEmbeddingAdapter",
+                4096,
+            ))
+            .expect_err("plain add_model_config must reject conflicting profile config");
+        assert!(
+            err.contains("already exists with different config"),
+            "unexpected error message: {err}"
+        );
+        assert!(
+            err.contains("append-only"),
+            "error must reference the append-only invariant: {err}"
+        );
+    }
+
+    /// The authoritative path is what `state::config_bootstrap` uses on
+    /// cold-start and on epoch-poller catch-up. It treats the export as
+    /// the source of truth and overrides any divergent stored profile
+    /// config (with a warn log) instead of failing the entire bootstrap.
+    /// Reproduces the v0.3.2 -> v0.3.3 `nemotron-8b` adapter swap that
+    /// wedged sie-test until a manual `kubectl rollout restart`.
+    #[test]
+    fn test_add_model_config_authoritative_overrides_conflicting_profile() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            r#"
+name: default
+priority: 10
+adapters:
+  - sie_server.adapters.sentence_transformer
+  - sie_server.adapters.pytorch_embedding
+"#,
+        )
+        .unwrap();
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        // Seed: gateway pod cold-started against an old sie-config rev.
+        registry
+            .add_model_config(cfg_for_test_model(
+                "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter",
+                4096,
+            ))
+            .expect("seed apply");
+
+        // sie-config rolls forward; export now carries a new adapter for
+        // the same profile. Authoritative apply must accept it.
+        registry
+            .add_model_config_authoritative(cfg_for_test_model(
+                "sie_server.adapters.pytorch_embedding:PyTorchEmbeddingAdapter",
+                8192,
+            ))
+            .expect("authoritative apply must override on diff, not fail");
+
+        // Confirm the registry now holds the new config: a follow-up plain
+        // apply of the same (new) config is a no-op (returns Ok with no
+        // newly created profiles), proving the stored CanonicalProfile is
+        // the overridden one. If the override had not taken effect, this
+        // call would hit append-only and return Err.
+        let (created, _skipped, _bundles) = registry
+            .add_model_config(cfg_for_test_model(
+                "sie_server.adapters.pytorch_embedding:PyTorchEmbeddingAdapter",
+                8192,
+            ))
+            .expect("replay of the now-stored config must succeed under append-only");
+        assert!(
+            created.is_empty(),
+            "replay of stored config must not report newly created profiles, got: {created:?}"
+        );
     }
 
     #[test]

@@ -92,6 +92,7 @@ export {
   LoraLoadingError,
   ModelLoadingError,
   ModelLoadFailedError,
+  InputTooLongError,
 } from "./errors.js";
 
 // Client-side scoring (MaxSim for ColBERT-style models)

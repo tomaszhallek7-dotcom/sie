@@ -453,6 +453,14 @@ export interface ExtractOptions {
   gpu?: string;
   /** Whether to wait for capacity */
   waitForCapacity?: boolean;
+  /**
+   * Adapter-specific runtime options forwarded to the server as
+   * `params.options`. Used for adapter knobs that aren't part of the
+   * core extract API — e.g. `{ overflow_policy: "error" }` for
+   * gliclass token-budget control. Mirrors the Python SDK's `options`
+   * keyword argument.
+   */
+  adapterOptions?: Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------

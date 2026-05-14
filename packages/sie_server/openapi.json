@@ -3,7 +3,7 @@
   "info": {
     "title": "SIE Server",
     "description": "Search Inference Engine - GPU inference server for search workloads",
-    "version": "0.3.3"
+    "version": "0.3.4"
   },
   "paths": {
     "/": {

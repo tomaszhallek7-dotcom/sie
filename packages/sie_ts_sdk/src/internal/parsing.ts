@@ -2,7 +2,13 @@
  * Parsing utilities for SIE responses
  */
 
-import { ModelLoadFailedError, ProvisioningError, RequestError, ServerError } from "../errors.js";
+import {
+  InputTooLongError,
+  ModelLoadFailedError,
+  ProvisioningError,
+  RequestError,
+  ServerError,
+} from "../errors.js";
 import { unpackMessage } from "../msgpack.js";
 import type {
   CapacityInfo,
@@ -135,6 +141,29 @@ export async function throwIfModelLoadFailed(response: Response, model?: string)
 }
 
 /**
+ * Throw {@link InputTooLongError} if the response is a 400 carrying the
+ * `INPUT_TOO_LONG` error code.
+ *
+ * Used by the extract path to surface token-budget overruns as a typed
+ * exception (so callers can catch {@link InputTooLongError} specifically)
+ * instead of relying on a generic {@link RequestError} + string-matching
+ * the `code`.
+ *
+ * No-op for any other status / error code.
+ */
+export async function throwIfInputTooLong(response: Response, model?: string): Promise<void> {
+  if (response.status !== 400) return;
+  const detail = await getErrorDetail(response.clone());
+  if (!detail) return;
+  if (detail.code !== "INPUT_TOO_LONG") return;
+  const message =
+    typeof detail.message === "string"
+      ? detail.message
+      : "Input exceeds the model's maximum token capacity";
+  throw new InputTooLongError(message, { model });
+}
+
+/**
  * Handle HTTP error response and throw appropriate error
  */
 export async function handleError(response: Response, gpu?: string): Promise<never> {
@@ -178,6 +207,11 @@ export async function handleError(response: Response, gpu?: string): Promise<nev
   }
 
   if (status >= HTTP_CLIENT_ERROR_MIN && status <= HTTP_CLIENT_ERROR_MAX) {
+    if (status === 400 && code === "INPUT_TOO_LONG") {
+      // Fallback dispatch — ``model`` is only attached by the helper-style
+      // short-circuit (``throwIfInputTooLong``) on the extract path.
+      throw new InputTooLongError(message);
+    }
     throw new RequestError(message, code, status);
   }
 

@@ -39,7 +39,7 @@ from sie_sdk.types import (
     SparseResult,
 )
 
-from .errors import ModelLoadFailedError, RequestError, ServerError
+from .errors import InputTooLongError, ModelLoadFailedError, RequestError, ServerError
 
 # Content types
 MSGPACK_CONTENT_TYPE = "application/msgpack"
@@ -72,6 +72,12 @@ MODEL_LOADING_ERROR_CODE = "MODEL_LOADING"  # Error code from server
 # and *no* Retry-After header so the SDK can short-circuit immediately
 # instead of burning the MODEL_LOADING retry budget.
 MODEL_LOAD_FAILED_ERROR_CODE = "MODEL_LOAD_FAILED"
+
+# Terminal client-side error: request input exceeds the model's maximum
+# token capacity. Server returns HTTP 400 + this code; the SDK surfaces
+# a typed ``InputTooLongError`` so callers can react without parsing
+# error codes by hand.
+INPUT_TOO_LONG_ERROR_CODE = "INPUT_TOO_LONG"
 
 # Resource-exhausted retry settings (server-side OOM recovery exhausted).
 # Default backoff sequence: 5 -> 10 -> 20 s (capped at 30s). Three attempts
@@ -373,6 +379,33 @@ def raise_if_model_load_failed(response: _HttpResponse, model: str | None = None
     )
 
 
+def raise_if_input_too_long(response: _HttpResponse, model: str | None = None) -> None:
+    """Raise :class:`InputTooLongError` if the response is 400 ``INPUT_TOO_LONG``.
+
+    Used by the extract path to surface token-budget overruns as a
+    typed exception (so callers can catch :class:`InputTooLongError`
+    specifically) instead of relying on a generic
+    :class:`RequestError` + string-matching the ``code``.
+
+    Args:
+        response: HTTP response to inspect.
+        model: Model name for inclusion in the raised error.
+
+    Raises:
+        InputTooLongError: If the response is a 400 carrying the
+            ``INPUT_TOO_LONG`` error code.
+    """
+    if response.status_code != HTTP_CLIENT_ERROR:
+        return
+    detail = get_error_detail(response)
+    if detail is None:
+        return
+    if detail.get("code") != INPUT_TOO_LONG_ERROR_CODE:
+        return
+    message = str(detail.get("message") or "Input exceeds the model's maximum token capacity")
+    raise InputTooLongError(message, model=model)
+
+
 def handle_error(response: _HttpResponse) -> None:
     """Handle error response from server.
 
@@ -409,6 +442,10 @@ def handle_error(response: _HttpResponse) -> None:
         # Fall back to raw text
         message = response.text or message
 
+    # Fallback dispatch — ``model`` is only attached by the helper-style
+    # short-circuit (``raise_if_input_too_long``) on the extract path.
+    if response.status_code == HTTP_CLIENT_ERROR and code == INPUT_TOO_LONG_ERROR_CODE:
+        raise InputTooLongError(message)
     if response.status_code >= HTTP_SERVER_ERROR:
         raise ServerError(message, code=code, status_code=response.status_code)
     raise RequestError(message, code=code, status_code=response.status_code)

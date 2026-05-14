@@ -61,6 +61,7 @@ import {
   parseEncodeResults,
   parseExtractResults,
   parseScoreResult,
+  throwIfInputTooLong,
   throwIfModelLoadFailed,
 } from "./internal/parsing.js";
 import { packMessage, unpackMessage } from "./msgpack.js";
@@ -531,6 +532,9 @@ export class SIEClient {
     };
     if (options.threshold !== undefined) {
       params.threshold = options.threshold;
+    }
+    if (options.adapterOptions !== undefined) {
+      params.options = options.adapterOptions;
     }
     body.params = params;
 
@@ -1062,6 +1066,9 @@ export class SIEClient {
       // surface the error immediately rather than burn the
       // MODEL_LOADING retry budget on a known-bad config.
       await throwIfModelLoadFailed(response, model);
+
+      // Short-circuit token-budget overruns (#849).
+      await throwIfInputTooLong(response, model);
 
       // Handle 503 with LORA_LOADING or MODEL_LOADING - auto-retry
       if (response.status === 503) {

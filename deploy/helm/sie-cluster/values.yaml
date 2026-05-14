@@ -157,6 +157,19 @@ gateway:
     port: 8080
     annotations: {}
 
+  # -- Block the gateway pod on sie-config readiness before it starts the
+  # cold-start bootstrap. Prevents the rolling-upgrade race where the
+  # gateway boots against the OLD sie-config revision and caches a stale
+  # profile config; on the next poll tick the NEW sie-config's export
+  # would otherwise hit the registry's append-only check and wedge the
+  # gateway (no models routable until manual restart).
+  # The gateway's authoritative apply path also survives the race, so
+  # disabling this gate is supported (defense in depth).
+  waitForConfig:
+    enabled: true
+    timeoutSeconds: 300
+    image: busybox:1.37.0
+
   # -- Pod annotations
   podAnnotations: {}
 
@@ -303,6 +316,12 @@ workers:
     # -- Bundle to use (default)
     bundle: default
 
+    # -- Logical queue pool consumed by workers in queue-routing mode.
+    # Defaults to "default" so Helm WorkerGroups serve unpinned SDK traffic.
+    # Override per worker pool with workers.pools.<name>.queuePool only for
+    # explicit isolation pools targeted via X-SIE-Pool or gpu="pool/profile".
+    queuePool: default
+
     # -- Runtime class for workers (e.g., "nvidia" to enable GPU runtime)
     runtimeClassName: ""
 
@@ -381,8 +400,9 @@ workers:
         failureThreshold: 3
 
   # -- Worker pools (one StatefulSet per pool)
-  # Each pool creates a WorkerGroup: one StatefulSet + one pre-pull DaemonSet.
-  # Pool naming convention: <machineProfile> (e.g. l4, a100-40gb, cpu).
+  # Each map entry creates a WorkerGroup: one StatefulSet + one pre-pull DaemonSet.
+  # The map key names the Kubernetes WorkerGroup, not the SDK logical pool.
+  # WorkerGroup naming convention: <machineProfile> (e.g. l4, a100-40gb, cpu).
   # All pools scale to zero by default — enable the ones you need.
   pools:
 
@@ -772,11 +792,30 @@ queueRouting:
 # gateway and worker pods. Use s3://bucket/prefix or gs://bucket/prefix.
 # Local filesystem paths (e.g., /tmp/payloads) will NOT work in queue mode
 # because gateway and worker pods have different filesystems.
+#
+# Auto-derivation: when workers.common.clusterCache.enabled=true and
+# workers.common.clusterCache.url is set, the chart enables the payload store
+# automatically and points it at the sibling /payloads prefix of the same
+# bucket. By convention the terraform modules expose the cache URL as
+# "<scheme>://<bucket>/models", and the chart strips a trailing "/models"
+# segment before appending "/payloads" so the two features live at top-level
+# sibling prefixes:
+#   <bucket>/models/...    model weights (managed by sie-admin)
+#   <bucket>/payloads/...  large work-item refs (managed by gateway)
+# The AWS and GCP terraform modules scope their workload IAM grants to these
+# top-level prefixes, so the auto-derived URL aligns with the permissions
+# out of the box. Set payloadStore.url explicitly only to override the
+# default (e.g., a separate bucket); leaving it empty is the right call
+# for most clusters.
 payloadStore:
-  # -- Enable payload store for large item offload.
+  # -- DEPRECATED, kept for backward compatibility only. The chart no longer
+  # reads this field; the payload store is enabled whenever the effective URL
+  # (see auto-derivation rules above) resolves to a non-empty value. Set
+  # payloadStore.url to "" and clusterCache.enabled to false to disable.
   enabled: false
   # -- Payload store URL. Must be an S3 or GCS URL (s3://bucket/prefix or gs://bucket/prefix).
   # Local paths are rejected when clusterRouting=queue (see gateway-deployment.yaml validation).
+  # Leave empty to auto-derive from workers.common.clusterCache.url (recommended).
   url: ""
   # -- TTL for stored payloads in seconds.
   # For S3: configure via S3 lifecycle rules on the bucket.

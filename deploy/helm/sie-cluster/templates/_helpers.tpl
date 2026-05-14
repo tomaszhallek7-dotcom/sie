@@ -281,3 +281,32 @@ KEDA apply hook: ServiceAccount name
 {{- define "sie-cluster.keda.apply.serviceAccountName" -}}
 {{- printf "%s-keda-apply" (include "sie-cluster.fullname" . | trunc 51 | trimSuffix "-") }}
 {{- end }}
+
+{{/*
+Resolve the effective payload-store URL.
+
+Resolution order:
+  1. .Values.payloadStore.url set explicitly -> use it verbatim.
+  2. .Values.workers.common.clusterCache.enabled and .url set -> derive a
+     sibling /payloads path at the same bucket root. Terraform exposes the
+     cache URL as "<scheme>://<bucket>/models" by convention, so the
+     auto-derivation strips a trailing "/models" segment before appending
+     "/payloads". The resulting layout is:
+       <bucket>/models/...    weights (managed by sie-admin cache)
+       <bucket>/payloads/...  large work-item refs (managed by gateway)
+     These siblings live at the bucket root, which is what the workload
+     IAM grants are scoped to in both the AWS and GCP terraform modules.
+  3. Otherwise -> empty string (payload store is off, no env vars rendered).
+
+Templates that consume this should treat a non-empty result as "payload
+store enabled" and an empty result as "off".
+*/}}
+{{- define "sie-cluster.payloadStoreUrl" -}}
+{{- if .Values.payloadStore.url -}}
+{{- .Values.payloadStore.url -}}
+{{- else if and .Values.workers.common.clusterCache.enabled .Values.workers.common.clusterCache.url -}}
+{{- $cache := trimSuffix "/" .Values.workers.common.clusterCache.url -}}
+{{- $base := trimSuffix "/models" $cache -}}
+{{- printf "%s/payloads" $base -}}
+{{- end -}}
+{{- end }}

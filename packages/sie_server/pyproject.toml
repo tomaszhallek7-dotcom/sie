@@ -1,6 +1,6 @@
 [project]
 name = "sie-server"
-version = "0.3.3"
+version = "0.3.4"
 description = "Search Inference Engine - GPU inference server for search workloads"
 requires-python = ">=3.12,<3.13"
 license = { text = "Apache-2.0" }
@@ -26,8 +26,15 @@ dependencies = [
     "gliner>=0.2,<1",
     "glirel>=1.0,<2",
     "gliclass>=0.1,<1",
-    # Docling — composite-document parser (PDF/DOCX/HTML) for extract()
+    # Docling, composite-document parser (PDF/DOCX/HTML) for extract()
     "docling>=2,<3",
+    # Pin opencv-python-headless in place of opencv-python (pulled in via
+    # docling -> rapidocr). The GUI build dlopens libxcb.so.1 / libGL.so.1
+    # which aren't present in the worker images; the headless wheel ships the
+    # same cv2 Python API without X11/GUI runtime deps. The transitive
+    # opencv-python request is suppressed via [tool.uv] override-dependencies
+    # in the root pyproject.toml.
+    "opencv-python-headless>=4,<5",
     "loguru>=0.7,<1",
     # SigLIP (Marqo/marqo-ecommerce-embeddings-B native open_clip loader)
     "open-clip-torch>=2.24",

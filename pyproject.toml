@@ -63,6 +63,13 @@ benchview = [
 
 [tool.uv]
 index-strategy = "unsafe-best-match"
+# Suppress the transitive opencv-python request from docling -> rapidocr.
+# The GUI build dlopens libxcb.so.1 / libGL.so.1, which aren't present in the
+# worker images. opencv-python-headless is pinned in sie_server/pyproject.toml
+# and ships the same cv2 Python API without the X11/GUI runtime deps.
+override-dependencies = [
+    "opencv-python; sys_platform == 'never'",
+]
 
 # Use CUDA PyTorch on Linux only
 # explicit = true ensures only torch/torchvision use this index, not other packages

@@ -12,6 +12,7 @@ For ColBERT/late interaction models, use the scoring module:
 """
 
 from sie_sdk.client import (
+    InputTooLongError,
     LoraLoadingError,
     ModelLoadFailedError,
     ModelLoadingError,
@@ -70,6 +71,7 @@ __all__ = [
     "Entity",
     "ExtractResult",
     "HealthResponse",
+    "InputTooLongError",
     "Item",
     "LoraLoadingError",
     "ModelInfo",

@@ -242,3 +242,27 @@ export class ModelLoadFailedError extends ServerError {
     this.attempts = options?.attempts ?? 1;
   }
 }
+
+/**
+ * Error when the request input exceeds the model's maximum token capacity.
+ *
+ * Thrown when the server returns HTTP `400 INPUT_TOO_LONG` for an
+ * extraction request. Distinct from generic {@link RequestError} so
+ * callers can branch on token-budget failures specifically (truncate
+ * the input client-side, switch to a longer-context model, or surface
+ * a targeted error to the end user) without parsing the error code.
+ *
+ * Subclass of {@link RequestError} so existing 4xx handlers continue
+ * to work; new code can catch {@link InputTooLongError} for tailored
+ * handling.
+ */
+export class InputTooLongError extends RequestError {
+  /** The model that was requested */
+  readonly model: string | undefined;
+
+  constructor(message: string, options?: { model?: string }) {
+    super(message, "INPUT_TOO_LONG", 400);
+    this.name = "InputTooLongError";
+    this.model = options?.model;
+  }
+}

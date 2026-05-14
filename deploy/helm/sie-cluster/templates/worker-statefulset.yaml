@@ -4,6 +4,7 @@
 {{- $bundle := default $root.Values.workers.common.bundle $pool.bundle }}
 {{- $platform := default $root.Values.workers.common.platform $pool.platform }}
 {{- $machineProfile := default $pool.gpuType $pool.machineProfile }}
+{{- $queuePool := default (default "default" $root.Values.workers.common.queuePool) $pool.queuePool }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -116,7 +117,7 @@ spec:
             - name: SIE_CLUSTER_ROUTING
               value: {{ $root.Values.clusterRouting | quote }}
             - name: SIE_POOL
-              value: {{ $poolName | quote }}
+              value: {{ $queuePool | quote }}
             {{- with $root.Values.queueRouting }}
             - name: SIE_NAK_DELAY_S
               value: {{ .nakDelaySec | default 5 | quote }}
@@ -128,9 +129,10 @@ spec:
               value: {{ .natsFetchBudget | default 64 | quote }}
             {{- end }}
             {{- end }}
-            {{- if $root.Values.payloadStore.enabled }}
+            {{- $payloadStoreUrl := include "sie-cluster.payloadStoreUrl" $root }}
+            {{- if $payloadStoreUrl }}
             - name: SIE_PAYLOAD_STORE_URL
-              value: {{ $root.Values.payloadStore.url | quote }}
+              value: {{ $payloadStoreUrl | quote }}
             {{- end }}
             # Telemetry
             {{- if and $root.Values.telemetry (hasKey $root.Values.telemetry "enabled") (not $root.Values.telemetry.enabled) }}

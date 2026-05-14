@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.3.4
+
+- chore(main): release 0.3.4
+- fix(sdk): widen sie-sdk requires-python to >=3.12
+- extend: GCP bucket provisioning, custom IAM roles, fix path mismatch
+- fix(gateway): tolerate config conflicts in bootstrap, gate on sie-config ready
+- feat(infra): default payload store to model-cache bucket /payloads
+- fix(deps): pin opencv-python-headless to drop X11 runtime deps
+- fix(chart): default workers to shared queue pool
+- feat(ts-sdk): add ExtractOptions.adapterOptions for adapter knobs
+- test(sdks): cover handle_error dispatch and tighten InputTooLongError tests
+- feat(sdks): add typed InputTooLongError for extract 400 INPUT_TOO_LONG
+
 ## v0.3.3
 
 - chore(main): release 0.3.3
