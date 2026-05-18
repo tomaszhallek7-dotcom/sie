@@ -39,22 +39,26 @@ SIE is an open-source inference engine that serves embeddings, reranking, and en
 
 ## Quickstart
 
-Or try it in your browser, no install needed: [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/superlinked/sie/blob/main/notebooks/quickstart.ipynb)
+SIE runs as a Docker container that your code calls over HTTP. Run the engine in one terminal, then talk to it from your app. Docker is the recommended path for local work: it ships the model runtime, CUDA bits, and dependencies as one image, so you avoid Python and driver setup.
 
-**1. Start the server**
+Prefer to try it in your browser without installing anything? [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/superlinked/sie/blob/main/notebooks/quickstart.ipynb)
+
+**1. Run the engine**
 
 ```bash
 docker run -p 8080:8080 ghcr.io/superlinked/sie-server:latest-cpu-default                # CPU
 docker run --gpus all -p 8080:8080 ghcr.io/superlinked/sie-server:latest-cuda12-default  # GPU
 ```
 
-**2. Install the SDK and go**
+First pull is around 1 GB (CPU) or 9 GB (GPU); after that the container is ready in seconds. The first call to a model also downloads weights from Hugging Face, which typically takes 30 seconds to a couple of minutes depending on model size. Subsequent calls hit a warm cache.
+
+**2. Call it from Python**
 
 ```bash
 pip install sie-sdk
 ```
 
-The entire API is three functions: `encode`, `score`, `extract`.
+The SDK is a small HTTP client; it does not run any models locally. The entire API is three functions: `encode`, `score`, `extract`.
 
 ```python
 from sie_sdk import SIEClient
