@@ -59,8 +59,6 @@ Confirm it is up:
 curl http://localhost:8080/readyz   # expect: ok
 ```
 
-See the [deployment guide](https://superlinked.com/docs/deployment/docker) for GPU pinning, read-only filesystems, and tuning.
-
 **2. Use SIE from Python or TypeScript**
 
 ```bash
@@ -89,8 +87,9 @@ scores = client.score(
     [Item(text="ML learns from data."), Item(text="The weather is sunny.")]
 )
 print(scores["scores"])
-# [{'item_id': 'item-0', 'score': 0.998, 'rank': 0},
-#  {'item_id': 'item-1', 'score': 0.012, 'rank': 1}]
+# [{'item_id': 'item-0', 'score': -7.1,    'rank': 0},
+#  {'item_id': 'item-1', 'score': -11.048, 'rank': 1}]
+# (cross-encoder logits; relative order is what matters, not the absolute value)
 
 # Extract: zero-shot named entity recognition, no training data
 result = client.extract(
@@ -99,8 +98,8 @@ result = client.extract(
     labels=["person", "organization"]
 )
 print(result["entities"])
-# [{'text': 'Tim Cook', 'label': 'person', 'score': 0.96},
-#  {'text': 'Apple', 'label': 'organization', 'score': 0.91}]
+# [{'text': 'Tim Cook', 'label': 'person',       'score': 0.991},
+#  {'text': 'Apple',    'label': 'organization', 'score': 0.978}]
 ```
 
 For the equivalent TypeScript example, see the [TypeScript SDK docs](https://superlinked.com/docs/reference/typescript-sdk/). For more, see the [full quickstart guide](https://superlinked.com/docs/quickstart/) and [SDK reference](https://superlinked.com/docs/reference/sdk/).
@@ -137,8 +136,10 @@ Pass the full Hugging Face model ID to the SDK (e.g. `sentence-transformers/all-
 
 [**Examples**](examples/): End-to-end project gallery
 
+[**Why we built SIE**](https://www.youtube.com/watch?v=qdh_x-uRs9g): The motivation, told at AI Engineer Europe 2026.
+
 ---
 
 <p align="center">
-  <a href="https://www.youtube.com/watch?v=qdh_x-uRs9g">Why we built SIE (AI Engineer Europe 2026)</a> | <a href="https://superlinked.com/docs"><strong>superlinked.com/docs</strong></a> | Apache 2.0
+  <a href="https://superlinked.com/docs"><strong>superlinked.com/docs</strong></a> | Apache 2.0
 </p>
