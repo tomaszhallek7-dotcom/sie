@@ -19,3 +19,16 @@ This typically takes 30–120s on first install. Track progress with:
   kubectl -n {{ include "sie-cluster.namespace" . }} get certificate -w
 The gateway will return TLS errors briefly until the certificate is Ready.
 {{- end }}
+{{- if and .Values.ingress.tls.enabled (eq .Values.ingress.tls.mode "self-signed") }}
+
+TLS via self-signed CA: a root CA, CA ClusterIssuer, and leaf cert are being issued by cert-manager.
+This typically takes 10-30s on first install. Track progress with:
+  kubectl -n {{ include "sie-cluster.namespace" . }} get certificate -w
+Export the root CA (e.g. to trust on a client machine):
+  kubectl -n {{ include "sie-cluster.namespace" . }} get secret {{ .Values.ingress.tls.selfSigned.rootCA.secretName }} \
+    -o jsonpath='{.data.ca\.crt}' | base64 -d > sie-root-ca.crt
+{{- if .Values.certManagerBundle.trustBundle.enabled }}
+The root CA is also replicated to selected namespaces as ConfigMap {{ .Values.certManagerBundle.trustBundle.name | quote }}
+(key: {{ .Values.certManagerBundle.trustBundle.target.configMapKey | quote }}) via trust-manager.
+{{- end }}
+{{- end }}

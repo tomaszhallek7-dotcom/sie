@@ -316,6 +316,15 @@ workers:
     # -- Bundle to use (default)
     bundle: default
 
+    # -- Image-tag bundle suffix override. Set this only when the logical
+    # `bundle` has no dedicated Docker image and reuses another bundle's
+    # image. Example: `sglang-embedding` shares deps and image with
+    # `sglang` (lockstep deps enforced by tests/test_bundles.py), so pools
+    # whose logical bundle is `sglang-embedding` set `imageBundle: sglang`
+    # to pull the built image. When unset, falls back to `bundle`. Labels,
+    # env vars, `--bundle` flag, and metrics still reflect `bundle`.
+    imageBundle: ""
+
     # -- Logical queue pool consumed by workers in queue-routing mode.
     # Defaults to "default" so Helm WorkerGroups serve unpinned SDK traffic.
     # Override per worker pool with workers.pools.<name>.queuePool only for
@@ -375,8 +384,12 @@ workers:
     extraEnv: []
 
     # -- Liveness/readiness/startup probe timing for worker pods. The httpGet
-    # path/port are contracts owned by the template (workers expose /healthz
-    # and /readyz). Only the timing fields below are overridable.
+    # path/port are contracts owned by the template: startup→/healthz (cheap,
+    # process-alive), liveness→/livez (GPU-aware; restarts a wedged CUDA context,
+    # issue #1025), readiness→/readyz (ready flag + GPU). Only the timing fields
+    # below are overridable. The liveness threshold is deliberately generous
+    # (30s × 3 = 90s, 10s timeout) so a momentarily busy GPU is not mistaken for
+    # a wedge.
     #
     # Defaults are tightened to reduce kubelet probe-poll latency on the
     # cold-start path (issue #814):
@@ -558,17 +571,27 @@ ingress:
   enabled: false
   className: nginx
   annotations: {}
-  # -- Hostname for ingress
+  # -- Hostnames served by the ingress. Each entry becomes an ingress rule and,
+  # when tls.enabled, a SAN on the TLS cert (all hosts share tls.secretName).
+  # Empty => host-less catch-all ingress.
+  hosts: []
+  # -- DEPRECATED single-hostname form, kept for backward compatibility.
+  # Ignored when `hosts` is non-empty; otherwise treated as a one-element `hosts`.
   host: ""
   # -- TLS configuration
   tls:
     enabled: false
-    # Mode: byo | cert-manager
+    # Mode: byo | cert-manager | self-signed | disabled (case-sensitive)
     #   byo:          user supplies a kubernetes.io/tls Secret named `secretName`. (default — backward compatible)
     #   cert-manager: chart adds a cert-manager annotation to the main Ingress; cert-manager populates `secretName`.
-    #                 Requires cert-manager to be installed in the cluster (one-time prerequisite).
+    #                 Requires cert-manager to be installed in the cluster (one-time prerequisite), OR set
+    #                 `certManagerBundle.certManager.install: true` to bundle it (single-tenant only — see chart README).
+    #   self-signed:  chart bootstraps a self-signed root CA, a CA ClusterIssuer, and a leaf cert for the Ingress.
+    #                 Requires cert-manager (either pre-existing or `certManagerBundle.certManager.install: true`).
+    #                 Intended for air-gapped / on-prem clusters where Let's Encrypt is unreachable.
+    #   disabled:     no TLS resources rendered. Use with TLS-terminating LB / sidecar / service mesh upstream.
     mode: byo
-    # Name of the kubernetes.io/tls Secret. In cert-manager mode this is where cert-manager writes the cert.
+    # Name of the kubernetes.io/tls Secret. In cert-manager / self-signed modes this is where the leaf cert is written.
     secretName: sie-tls
     # cert-manager-specific knobs (only used when mode=cert-manager)
     certManager:
@@ -590,6 +613,44 @@ ingress:
       # HTTP-01 solver ingress class. Empty => defaults to .Values.ingress.className. Override only if your
       # cert-manager solver needs a different class than your data-plane ingress (rare).
       ingressClassName: ""
+    # Self-signed-specific knobs (only used when mode=self-signed).
+    selfSigned:
+      # Root CA Certificate (cluster-issued via the SelfSigned bootstrap ClusterIssuer).
+      rootCA:
+        # Namespace the root CA Certificate / Secret lives in. MUST equal cert-manager's
+        # --cluster-resource-namespace (cert-manager looks up secrets referenced by
+        # ClusterIssuers only in that namespace). Empty => release namespace, which is
+        # correct for the bundled subchart (cert-manager runs in the release namespace and
+        # --cluster-resource-namespace defaults to POD_NAMESPACE). When pointing at an
+        # external cert-manager, set this to that cert-manager's deployment namespace
+        # (typically "cert-manager"), otherwise the CA ClusterIssuer will report
+        # "secret not found" and leaf issuance will hang.
+        namespace: ""
+        # Secret name where the root CA key/cert pair is stored. Used as ca.secretName for the CA ClusterIssuer
+        # and as the source for the trust-manager Bundle (if enabled).
+        secretName: sie-root-ca-key-pair
+        # X.509 CommonName for the root CA. Surfaces in browsers / clients that inspect the cert chain.
+        commonName: SIE Self-Signed Root CA
+        # Validity. 43800h = 5y. cert-manager renews at duration - renewBefore.
+        duration: 43800h
+        renewBefore: 720h
+        privateKey:
+          algorithm: rsa
+          size: 4096
+      # CA ClusterIssuer that signs leaf certs from the root CA.
+      caClusterIssuer:
+        name: sie-self-signed-ca
+      # Leaf Certificate for the Ingress (consumed via ingress.tls.secretName).
+      leaf:
+        # 2160h = 90d (Let's Encrypt-style lifetime); cert-manager renews at duration - renewBefore.
+        duration: 2160h
+        renewBefore: 360h
+        privateKey:
+          algorithm: ecdsa
+          size: 256
+        # Extra SANs in addition to ingress.host. Useful for multi-host overlays or internal in-cluster DNS.
+        dnsNames: []
+        ipAddresses: []
 
 # -- Auth configuration (ingress-nginx + oauth2-proxy)
 auth:
@@ -784,6 +845,12 @@ queueRouting:
   # groups fetched messages by model and dispatches them as a single forward pass.
   # Higher values improve GPU utilization under load but increase per-request latency.
   natsFetchBudget: 64
+  # -- Worker admission gate for capped pools. Workers ask the gateway whether
+  # their pod is in the pool's assigned_workers before pulling from NATS.
+  poolAdmission:
+    checkIntervalSec: 10
+    pauseSec: 1
+    staleAfterSec: 30
 
 # -- Payload store for large work item payloads (images, long documents).
 # When a work item exceeds 1MB, the payload is offloaded to this store.
@@ -827,6 +894,85 @@ payloadStore:
 # Sub-chart dependency control flags
 # All sub-charts are disabled by default. Enable what you need in your overlay.
 # =============================================================================
+
+# -- cert-manager subchart values (opt-in; default off). The `install` flag lives under
+# `certManagerBundle.certManager.install` (NOT here) because the cert-manager subchart enforces a
+# JSON Schema with additionalProperties=false, which rejects any extra key under this block. Override
+# subchart values here for things cert-manager actually understands.
+# Bundling is for SINGLE-TENANT clusters where SIE is the sole workload. If your cluster already
+# runs cert-manager, leave certManagerBundle.certManager.install=false and use
+# ingress.tls.mode=cert-manager against the existing install — bundling hard-fails via a pre-install
+# conflict-detection Job hook.
+cert-manager:
+  crds:
+    # CRDs are vendored under deploy/helm/sie-cluster/crds/ instead of being rendered by the subchart.
+    # Helm applies files in `crds/` BEFORE template discovery, which is the only mechanism that lets the
+    # bundled install render Certificate/ClusterIssuer/Bundle resources in a single `helm install` (the
+    # subchart's templated CRDs land too late — RESTMapper discovery fails first). Vendored bundle is
+    # `cert-manager.crds.yaml` pinned to the same version as the subchart pin in Chart.yaml; bump them
+    # together (see chart README §Bundling cert-manager → Vendored CRDs).
+    enabled: false
+    # `keep` is moot when enabled=false; the vendored files use `helm.sh/resource-policy: keep` directly.
+    keep: true
+  prometheus:
+    enabled: true
+    servicemonitor:
+      enabled: true
+  global:
+    leaderElection:
+      # Pin the leader-election namespace so cert-manager works regardless of release namespace.
+      namespace: cert-manager
+
+# -- trust-manager subchart values (opt-in; default off). The `install` flag lives under
+# `certManagerBundle.trustManager.install` (NOT here) — same reason as cert-manager. Used to
+# replicate the self-signed root CA bundle into other namespaces as a ConfigMap("ca.crt").
+# Requires cert-manager (either bundled or pre-existing).
+#
+# IMPORTANT: trust-manager's --trust-namespace defaults to "cert-manager" — it will only find
+# source Secrets in that namespace. The self-signed root CA Secret is written to
+# ingress.tls.selfSigned.rootCA.namespace (defaults to release namespace). For the bundled
+# trustBundle to sync, those two namespaces MUST match. Either:
+#   (a) set ingress.tls.selfSigned.rootCA.namespace: cert-manager  (route the root CA into the
+#       same namespace trust-manager looks in), OR
+#   (b) override trust-manager.app.trust.namespace at install time:
+#       --set trust-manager.app.trust.namespace=<release-namespace>
+# Symptom when mismatched: trust-manager logs `bundle source was not found`, Bundle stays
+# Synced=False with reason SourceNotFound.
+trust-manager:
+  # Disable the public CA bundle to reduce image size and CVE surface. Flip on if workloads need WebPKI roots.
+  defaultPackage:
+    enabled: false
+  secretTargets:
+    # Bundles render to ConfigMaps; we do not need write-to-Secret targets.
+    enabled: false
+  crds:
+    # Vendored under deploy/helm/sie-cluster/crds/ — same reason as the cert-manager block above.
+    enabled: false
+
+# -- SIE-owned controls for the bundled cert-manager / trust-manager (sie-cluster chart values, not subchart values).
+# The `install` flags below are the user-facing switches for bundling cert-manager / trust-manager.
+# They live here (instead of under `cert-manager.install` / `trust-manager.install`) because the
+# cert-manager and trust-manager subcharts ship strict JSON Schemas (additionalProperties=false) that
+# reject any extra key at the root of their values blocks.
+certManagerBundle:
+  certManager:
+    # -- Install cert-manager as a sub-chart. See chart README §TLS / HTTPS for the conflict-detection guard.
+    install: false
+  trustManager:
+    # -- Install trust-manager as a sub-chart.
+    install: false
+  # When true, skip the pre-install / template-time CRD conflict guard and proceed even if cert-manager CRDs
+  # already exist in the cluster. DANGER: only set true if you understand that two cert-manager controllers
+  # racing on the same CRDs WILL corrupt issuance state. Default is false.
+  allowExistingCRDs: false
+  # trust-manager Bundle that replicates the self-signed root CA into other namespaces as a ConfigMap.
+  trustBundle:
+    enabled: false
+    name: sie-root-ca-bundle
+    target:
+      configMapKey: ca.crt
+    namespaceSelector:
+      matchLabels: {}
 
 # -- KEDA autoscaler (required for scale-to-zero worker autoscaling)
 keda:
@@ -974,10 +1120,26 @@ dcgm-exporter:
     - "-f"
     - "/etc/dcgm-exporter/dcp-metrics-included.csv"
 
+# -- Observability feature gates
+observability:
+  logs:
+    # -- Optional global log observability override. Omitted by default, so the
+    # component toggles below decide. Set true to install Loki plus Alloy with
+    # one flag. Set false to force both off even if component toggles are true.
+    # Kubernetes events remain controlled by kubernetes-event-exporter.install.
+    # install: true
+    loki:
+      # -- Install bundled Loki. Can be enabled alone when logs are written by
+      # another collector.
+      install: false
+    alloy:
+      # -- Install bundled Alloy. Can be enabled alone when forwarding to an
+      # external Loki endpoint via alloy.logs.lokiUrl.
+      install: false
+
 # -- Loki log aggregation (Tier 2 - optional)
+# Installed when observability.logs.install=true or observability.logs.loki.install=true.
 loki:
-  # -- Install Loki as a sub-chart
-  install: false
   # -- Force a predictable service name so Alloy/Grafana/event-exporter can use
   # the static URL http://loki:3100 regardless of the Helm release name.
   fullnameOverride: loki
@@ -1027,9 +1189,12 @@ loki:
     enabled: false
 
 # -- Grafana Alloy log collector (Tier 2 - optional, replaces Promtail)
+# Installed when observability.logs.install=true or observability.logs.alloy.install=true.
 alloy:
-  # -- Install Alloy as a sub-chart
-  install: false
+  logs:
+    # -- Loki push endpoint used by the parent-rendered Alloy config. Override
+    # when observability.logs.alloy.install=true but bundled Loki is disabled.
+    lokiUrl: "http://loki:3100/loki/api/v1/push"
   alloy:
     configMap:
       # -- The River config is rendered from files/alloy/config.alloy via templates/alloy-configmap.yaml.
@@ -1041,20 +1206,20 @@ alloy:
       # this to a unique name to avoid ConfigMap conflicts.
       name: "sie-alloy-config"
       key: "config.alloy"
+    mounts:
+      varlog: true
+      dockercontainers: true
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "64Mi"
+      limits:
+        cpu: "200m"
+        memory: "256Mi"
   controller:
     type: daemonset
-  mounts:
-    varlog: true
-    dockercontainers: true
-  resources:
-    requests:
-      cpu: "50m"
-      memory: "64Mi"
-    limits:
-      cpu: "200m"
-      memory: "256Mi"
-  tolerations:
-    - operator: Exists
+    tolerations:
+      - operator: Exists
 
 # -- Kubernetes Event Exporter (Tier 2 - optional, sends K8s events to Loki)
 # Broadcom moved Bitnami community images behind a paywall on Docker Hub

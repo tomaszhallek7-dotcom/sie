@@ -511,7 +511,7 @@ Emitted from a Tower middleware (`MetricsLayer` in `middleware/metrics.rs`) that
 
 ### 15.5 Pool lifecycle — gateway
 
-- `sie_gateway_pool_events_total{event}` — counter. `event` is one of `created`, `renewed`, `deleted`, `expired`. Complements the `active_lease_gpus` gauge: the gauge shows current state, this counter shows the rate of churn. A 5-minute rate over `event="expired"` catches runaway expirations; a sustained `event="created"` rate catches runaway pool creation.
+- `sie_gateway_pool_events_total{event}` — counter. `event` is one of `created`, `updated`, `renewed`, `deleted`, `expired`. Complements the `active_lease_gpus` gauge: the gauge shows current state, this counter shows the rate of churn. A 5-minute rate over `event="expired"` catches runaway expirations; a sustained `event="created"` rate catches runaway pool creation.
 
 ### 15.6 Config plane — gateway
 
@@ -690,13 +690,18 @@ POST /v1/pools
 {
   "name": "customer-acme",
   "gpus": {"l4-spot": 2},
+  "gpu_caps": {"l4-spot": 4},
   "bundle": "sglang",
   "ttl_seconds": 3600
 }
 ```
 
+`gpus` is required capacity; `gpu_caps` is an optional assignment cap. The `default` pool has zero requirements and no caps. Capped workers poll pool status every 10 seconds before NATS pulls. HA gateways sort workers deterministically and persist named-pool assignment status.
+
+Helm publishes canonical machine profiles in `SIE_GATEWAY_CONFIGURED_GPUS` and request aliases in `SIE_GATEWAY_GPU_ALIASES`.
+
 Each pool gets its own JetStream stream (`WORK_POOL_{name}`) with subjects `sie.work.*.{name}`. Workers are deployed with `SIE_POOL={name}` and consume only from their own pool's stream. That is the isolation boundary.
 
-Creating a usable custom pool is a two-step operation: add the pool to Helm values so a `StatefulSet` of workers actually exists, then register the pool on the gateway via `POST /v1/pools` so it tracks fulfillment. Clients then target the pool with an `X-SIE-POOL: customer-acme` header. Pools expire after their TTL unless renewed with `POST /v1/pools/{name}/renew`; the `default` pool is protected and cannot be deleted.
+Creating a usable custom pool is a two-step operation: add the pool to Helm values so a `StatefulSet` of workers actually exists with `queuePool`/`SIE_POOL` set to the logical pool name, then register the pool on the gateway via `POST /v1/pools` so it tracks fulfillment and admission. Clients then target the pool with an `X-SIE-POOL: customer-acme` header. Pools expire after their TTL unless renewed with `POST /v1/pools/{name}/renew`; the `default` pool is protected and cannot be deleted.
 
 Model configs registered via the control plane (`sie-config`) are not tied to a pool — they describe what the cluster can serve, not who gets to serve it. Pool membership, worker counts, and GPU types are Helm-driven and independent of the config API.

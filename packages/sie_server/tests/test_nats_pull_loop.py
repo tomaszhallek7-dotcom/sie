@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -10,7 +11,13 @@ import pytest
 from sie_server.core.inference_output import ExtractOutput, ScoreOutput
 from sie_server.core.timing import RequestTiming
 from sie_server.core.worker.types import WorkerResult
-from sie_server.nats_pull_loop import _OOM_NAK_DELAY_S, NatsPullLoop
+from sie_server.nats_pull_loop import (
+    _OOM_NAK_DELAY_S,
+    NatsPullLoop,
+    _fairness_config_from_env,
+    _PoolAdmissionGate,
+    _resolve_generation_admission,
+)
 from sie_server.types.inputs import Item
 
 
@@ -71,6 +78,196 @@ def _published_result(nc_mock: AsyncMock) -> dict:
     nc_mock.publish.assert_called_once()
     _subject, data = nc_mock.publish.call_args.args
     return msgpack.unpackb(data, raw=False)
+
+
+def test_resolve_generation_admission_uses_requested_model_config() -> None:
+    registry = MagicMock()
+
+    first = MagicMock()
+    first.sie_id = "first/model"
+    first.tasks.generate = object()
+    first_resolved = MagicMock(kv_budget_tokens=1024, admission_enabled=False)
+    first.resolve_profile.return_value = first_resolved
+
+    second = MagicMock()
+    second.sie_id = "second/model"
+    second.tasks.generate = object()
+    second_resolved = MagicMock(kv_budget_tokens=2048, admission_enabled=True)
+    second.resolve_profile.return_value = second_resolved
+
+    registry.get_config.side_effect = {"first/model": first, "second/model": second}.__getitem__
+
+    assert _resolve_generation_admission(registry, "second/model") == (2048, True)
+    second.resolve_profile.assert_called_once_with("default")
+    first.resolve_profile.assert_not_called()
+
+
+class _FakePoolClient:
+    def __init__(self, pool: dict | None = None, exc: Exception | None = None) -> None:
+        self.pool = pool
+        self.exc = exc
+        self.closed = False
+
+    async def get_pool(self, _name: str) -> dict | None:
+        if self.exc is not None:
+            raise self.exc
+        return self.pool
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class TestPoolAdmissionGate:
+    @pytest.mark.asyncio
+    async def test_disabled_gate_admits(self) -> None:
+        gate = _PoolAdmissionGate(
+            pool_name="bench",
+            worker_id="worker-1",
+            machine_profile="l4",
+            gateway_url="",
+            api_key=None,
+        )
+
+        assert await gate.admitted() is True
+
+    @pytest.mark.asyncio
+    async def test_uncapped_pool_admits_any_worker(self) -> None:
+        gate = _PoolAdmissionGate(
+            pool_name="bench",
+            worker_id="worker-1",
+            machine_profile="l4",
+            gateway_url="http://gateway",
+            api_key=None,
+            check_interval_s=0,
+            client=_FakePoolClient({"spec": {"gpu_caps": {}}, "status": {"assigned_workers": []}}),
+        )
+
+        assert await gate.admitted() is True
+
+    @pytest.mark.asyncio
+    async def test_capped_pool_requires_assigned_worker(self) -> None:
+        pool = {
+            "spec": {"gpu_caps": {"l4": 1}},
+            "status": {"assigned_workers": [{"name": "worker-1", "gpu": "l4"}]},
+        }
+        gate = _PoolAdmissionGate(
+            pool_name="bench",
+            worker_id="worker-1",
+            machine_profile="l4",
+            gateway_url="http://gateway",
+            api_key=None,
+            check_interval_s=0,
+            client=_FakePoolClient(pool),
+        )
+
+        assert await gate.admitted() is True
+
+    @pytest.mark.asyncio
+    async def test_capped_pool_pauses_unassigned_worker(self) -> None:
+        pool = {
+            "spec": {"gpu_caps": {"l4": 1}},
+            "status": {"assigned_workers": [{"name": "worker-2", "gpu": "l4"}]},
+        }
+        gate = _PoolAdmissionGate(
+            pool_name="bench",
+            worker_id="worker-1",
+            machine_profile="l4",
+            gateway_url="http://gateway",
+            api_key=None,
+            check_interval_s=0,
+            client=_FakePoolClient(pool),
+        )
+
+        assert await gate.admitted() is False
+
+    @pytest.mark.asyncio
+    async def test_zero_cap_pauses_worker(self) -> None:
+        gate = _PoolAdmissionGate(
+            pool_name="bench",
+            worker_id="worker-1",
+            machine_profile="l4",
+            gateway_url="http://gateway",
+            api_key=None,
+            check_interval_s=0,
+            client=_FakePoolClient({"spec": {"gpu_caps": {"l4": 0}}, "status": {"assigned_workers": []}}),
+        )
+
+        assert await gate.admitted() is False
+
+    @pytest.mark.asyncio
+    async def test_zero_cap_pauses_even_if_worker_still_assigned(self) -> None:
+        gate = _PoolAdmissionGate(
+            pool_name="bench",
+            worker_id="worker-1",
+            machine_profile="l4",
+            gateway_url="http://gateway",
+            api_key=None,
+            check_interval_s=0,
+            client=_FakePoolClient(
+                {
+                    "spec": {"gpu_caps": {"l4": 0}},
+                    "status": {"assigned_workers": [{"name": "worker-1", "gpu": "l4"}]},
+                }
+            ),
+        )
+
+        assert await gate.admitted() is False
+
+    @pytest.mark.asyncio
+    async def test_malformed_cap_pauses_worker(self) -> None:
+        gate = _PoolAdmissionGate(
+            pool_name="bench",
+            worker_id="worker-1",
+            machine_profile="l4",
+            gateway_url="http://gateway",
+            api_key=None,
+            check_interval_s=0,
+            client=_FakePoolClient(
+                {
+                    "spec": {"gpu_caps": {"l4": "nope"}},
+                    "status": {"assigned_workers": [{"name": "worker-1", "gpu": "l4"}]},
+                }
+            ),
+        )
+
+        assert await gate.admitted() is False
+
+    @pytest.mark.asyncio
+    async def test_named_pool_status_error_fails_closed(self) -> None:
+        gate = _PoolAdmissionGate(
+            pool_name="bench",
+            worker_id="worker-1",
+            machine_profile="l4",
+            gateway_url="http://gateway",
+            api_key=None,
+            check_interval_s=0,
+            client=_FakePoolClient(exc=RuntimeError("boom")),
+        )
+
+        assert await gate.admitted() is False
+
+
+class TestPullLoopAdmission:
+    @pytest.mark.asyncio
+    async def test_run_skips_fetch_when_not_admitted(self) -> None:
+        loop = _make_loop()
+        loop._pool_sub = AsyncMock()
+        loop._running = True
+        gate = AsyncMock()
+        gate.admitted = AsyncMock(return_value=False)
+        gate.pause_s = 0.001
+        loop._admission_gate = gate
+
+        task = asyncio.create_task(loop._run())
+        await asyncio.sleep(0.01)
+        loop._running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        loop._pool_sub.fetch.assert_not_called()
 
 
 class TestProcessEncodeItem:
@@ -602,3 +799,126 @@ class TestBatchProcessing:
         assert sum(1 for m in messages if m.ack.await_count > 0) == 5
         # All 5 results should be published
         assert nc.publish.await_count == 5
+
+
+class TestGenerateDispatch:
+    """Generate work items route through the StreamingProcessor seam."""
+
+    @pytest.mark.asyncio
+    async def test_generate_op_routes_through_streaming_processor(self) -> None:
+        nc = AsyncMock()
+        loop = _make_loop(nc=nc)
+        # Stub the streaming processor — we only assert dispatch here.
+        loop._streaming_processor = MagicMock()
+        loop._streaming_processor.process = AsyncMock()
+
+        wi = _make_work_item(
+            operation="generate",
+            generate={"prompt": "Hello", "max_new_tokens": 32},
+        )
+        msg = _make_msg(wi)
+
+        await loop._process_messages("test/model", [msg])
+
+        loop._streaming_processor.process.assert_awaited_once()
+        # First positional arg is the message.
+        call_args = loop._streaming_processor.process.await_args
+        assert call_args.args[0] is msg
+        assert call_args.args[1] == "test/model"
+
+    @pytest.mark.asyncio
+    async def test_encode_path_unchanged_after_seam_introduction(self) -> None:
+        """Regression: introducing the generate seam must not perturb encode."""
+        nc = AsyncMock()
+        registry = MagicMock()
+        registry.model_names = ["test/model"]
+        registry.get_config.return_value = MagicMock()
+        registry.start_worker = AsyncMock(return_value=MagicMock())
+
+        loop = _make_loop(nc=nc, registry=registry)
+        # Sanity: the streaming processor exists on the loop now.
+        assert loop._streaming_processor is not None
+
+        wi = _make_work_item(operation="encode", item={"text": "x"}, output_types=["dense"])
+        msg = _make_msg(wi)
+
+        fake_output = [{"dense": np.array([0.1, 0.2], dtype=np.float32)}]
+        fake_timing = RequestTiming()
+
+        with patch(
+            "sie_server.core.encode_pipeline.EncodePipeline.run_encode",
+            new_callable=AsyncMock,
+            return_value=(fake_output, fake_timing),
+        ):
+            await loop._process_messages("test/model", [msg])
+
+        msg.ack.assert_awaited()
+        nc.publish.assert_awaited()
+
+
+# ── Mixed-pool fairness scheduler wiring ──────────────────────────────
+
+
+def test_fairness_config_from_env_disabled_by_default(monkeypatch) -> None:
+    for k in list(os.environ):
+        if k.startswith("SIE_POOL_FAIRNESS"):
+            monkeypatch.delenv(k, raising=False)
+    assert _fairness_config_from_env() is None
+
+
+def test_fairness_config_from_env_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("SIE_POOL_FAIRNESS_ENABLED", "true")
+    monkeypatch.setenv("SIE_POOL_FAIRNESS_TOTAL_SLOTS", "6")
+    monkeypatch.setenv("SIE_POOL_FAIRNESS_GEN_WEIGHT", "3")
+    monkeypatch.setenv("SIE_POOL_FAIRNESS_EMB_MIN_SLOTS", "2")
+    cfg = _fairness_config_from_env()
+    assert cfg is not None
+    assert cfg.total_slots == 6
+    from sie_server.processors.work_class_scheduler import EMBEDDING_CLASS, GENERATION_CLASS
+
+    assert cfg.classes[GENERATION_CLASS].weight == 3.0
+    assert cfg.classes[EMBEDDING_CLASS].min_slots == 2
+
+
+def test_fairness_config_from_env_invalid_disables(monkeypatch) -> None:
+    # Over-subscribed floor (sum(min_slots) > total_slots) would deadlock;
+    # the helper logs and returns None rather than crashing the worker.
+    monkeypatch.setenv("SIE_POOL_FAIRNESS_ENABLED", "1")
+    monkeypatch.setenv("SIE_POOL_FAIRNESS_TOTAL_SLOTS", "2")
+    monkeypatch.setenv("SIE_POOL_FAIRNESS_GEN_MIN_SLOTS", "2")
+    monkeypatch.setenv("SIE_POOL_FAIRNESS_EMB_MIN_SLOTS", "2")
+    assert _fairness_config_from_env() is None
+
+
+def test_class_slot_noop_without_fairness(monkeypatch) -> None:
+    for k in list(os.environ):
+        if k.startswith("SIE_POOL_FAIRNESS"):
+            monkeypatch.delenv(k, raising=False)
+    loop = _make_loop()
+    assert loop._scheduler is None
+
+    async def _run() -> None:
+        async with loop._class_slot("generate"):
+            pass  # no scheduler → pure pass-through
+
+    asyncio.run(_run())
+
+
+def test_class_slot_gates_with_fairness(monkeypatch) -> None:
+    monkeypatch.setenv("SIE_POOL_FAIRNESS_ENABLED", "true")
+    monkeypatch.setenv("SIE_POOL_FAIRNESS_TOTAL_SLOTS", "4")
+    monkeypatch.setenv("SIE_POOL_FAIRNESS_EMB_MIN_SLOTS", "1")
+    loop = _make_loop()
+    assert loop._scheduler is not None
+
+    async def _run() -> dict:
+        async with loop._class_slot("generate"):
+            return loop._scheduler.saturation_snapshot()
+
+    snap = asyncio.run(_run())
+    from sie_server.processors.work_class_scheduler import GENERATION_CLASS
+
+    # A generation slot was leased inside the block.
+    assert snap["classes"][GENERATION_CLASS]["leased"] == 1
+    # Released on exit → scheduler returns to idle.
+    assert loop._scheduler.saturation_snapshot()["total_leased"] == 0

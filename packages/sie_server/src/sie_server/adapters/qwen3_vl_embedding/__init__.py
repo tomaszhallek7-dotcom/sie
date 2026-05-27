@@ -13,6 +13,7 @@ from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
 from sie_server.core.inference_output import EncodeOutput
+from sie_server.types.inputs import media_bytes
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -356,7 +357,7 @@ class Qwen3VLEmbeddingAdapter(BaseAdapter):
         pil_images = []
         for idx, img_input in enumerate(item.images or []):
             try:
-                pil_img = Image.open(io.BytesIO(img_input["data"]))
+                pil_img = Image.open(io.BytesIO(media_bytes(img_input, kind="image")))
                 if pil_img.mode != "RGB":
                     pil_img = pil_img.convert("RGB")
                 pil_images.append(pil_img)
@@ -381,7 +382,7 @@ class Qwen3VLEmbeddingAdapter(BaseAdapter):
             return []
 
         try:
-            video_bytes = video_input["data"]
+            video_bytes = media_bytes(video_input, kind="video")
         except (KeyError, TypeError) as exc:
             logger.warning("Failed to read video data: %s", exc)
             return []

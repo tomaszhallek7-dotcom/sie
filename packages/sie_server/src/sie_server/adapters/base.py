@@ -25,7 +25,7 @@ class ModelCapabilities(BaseModel):
     inputs: list[Literal["text", "image", "audio", "video", "document"]] = Field(
         description="Input modalities supported"
     )
-    outputs: list[Literal["dense", "sparse", "multivector", "score", "json"]] = Field(
+    outputs: list[Literal["dense", "sparse", "multivector", "score", "json", "tokens"]] = Field(
         description="Output types the adapter can produce"
     )
 

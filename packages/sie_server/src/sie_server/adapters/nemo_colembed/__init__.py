@@ -38,6 +38,7 @@ from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ComputePrecision
 from sie_server.core.inference_output import EncodeOutput
+from sie_server.types.inputs import media_bytes
 
 if TYPE_CHECKING:
     from sie_server.types.inputs import Item
@@ -409,7 +410,7 @@ class NemoColEmbedAdapter(BaseAdapter):
                 raise ValueError(_ERR_NO_INPUT)
 
             # Load first image from each item (ImageInput is also a TypedDict)
-            img_bytes = item.images[0]["data"]
+            img_bytes = media_bytes(item.images[0], kind="image")
             pil_img = Image.open(io.BytesIO(img_bytes))
             if pil_img.mode != "RGB":
                 pil_img = pil_img.convert("RGB")

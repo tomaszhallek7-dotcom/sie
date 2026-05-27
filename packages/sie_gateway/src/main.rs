@@ -7,8 +7,10 @@ mod http_error;
 mod metrics;
 mod middleware;
 mod nats;
+mod observability;
 mod openapi;
 mod queue;
+mod routing;
 mod server;
 mod state;
 mod types;
@@ -33,7 +35,6 @@ use server::AppState;
 use state::model_registry::ModelRegistry;
 use state::pool_manager::PoolManager;
 use state::worker_registry::WorkerRegistry;
-use types::PoolState;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -149,36 +150,22 @@ async fn main() {
                 cfg.models_dir = dir;
             }
 
-            setup_logging(&cfg.log_level, cfg.json_logs);
+            // Initialise tracing + OpenTelemetry. Always installs the
+            // global W3C trace-context propagator (even without an
+            // OTLP exporter) so inbound `traceparent` headers
+            // continue to flow through the work envelope.
+            observability::tracing::init_tracing(&cfg.log_level, cfg.json_logs);
 
-            if let Err(e) = run_server(cfg).await {
+            let result = run_server(cfg).await;
+            if let Err(e) = result {
                 tracing::error!(error = %e, "server error");
+                // Flush the terminal error span/log before the process exits.
+                observability::tracing::shutdown_tracing();
                 std::process::exit(1);
             }
+            // Flush any pending spans before the process exits.
+            observability::tracing::shutdown_tracing();
         }
-    }
-}
-
-fn setup_logging(level: &str, json: bool) {
-    use tracing_subscriber::EnvFilter;
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        let level_str = match level.to_lowercase().as_str() {
-            "debug" => "debug",
-            "warn" | "warning" => "warn",
-            "error" => "error",
-            _ => "info",
-        };
-        EnvFilter::new(level_str)
-    });
-
-    if json {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 }
 
@@ -191,6 +178,12 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // before any proxied traffic has landed. See `init_metric_families`
     // for why dashboards on a freshly booted gateway need this.
     metrics::init_metric_families();
+
+    // Surface a loud warning if the operator has opted in
+    // to raw routing-key logging. The default (flag unset) emits only
+    // the `xxh:` prefix, which is the privacy contract documented in
+    // `routing::fmt_key_hash`.
+    routing::warn_if_raw_logging_enabled();
 
     // Log auth and NATS producer-trust configuration findings; does
     // not fail startup.
@@ -248,9 +241,19 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let registry = Arc::new(WorkerRegistry::new(
+    // `on_worker_degraded` is wired now (no-op closure) so future
+    // direct-dispatch ring-cache invalidation can attach here without
+    // a follow-up PR re-touching this construction site.
+    let on_worker_degraded: Option<state::worker_registry::OnWorkerDegraded> =
+        Some(Arc::new(|_w: &types::WorkerState| {
+            // Ring snapshots are rebuilt per-request today (see
+            // `WorkerRegistry::ring_snapshot_for`); when a cache layer
+            // lands it should invalidate from this callback.
+        }));
+    let registry = Arc::new(WorkerRegistry::with_callbacks(
         Duration::from_secs(15),
         on_worker_healthy,
+        on_worker_degraded,
     ));
 
     // Set up discovery
@@ -562,13 +565,12 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     _ = notify.notified() => {}
                 }
                 let pools = pm.list_pools().await;
-                let has_pending = pools.iter().any(|p| p.status.state == PoolState::Pending);
-                if !has_pending {
+                if pools.is_empty() {
                     continue;
                 }
 
                 let workers = reg.healthy_workers().await;
-                let worker_tuples: Vec<(String, String, String, String)> = workers
+                let worker_tuples: Vec<(String, String, String, String, String)> = workers
                     .iter()
                     .map(|w| {
                         (
@@ -576,14 +578,13 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                             w.url.clone(),
                             w.machine_profile.clone(),
                             w.bundle.clone(),
+                            w.pool_name.clone(),
                         )
                     })
                     .collect();
 
                 for pool in &pools {
-                    if pool.status.state == PoolState::Pending {
-                        pm.assign_workers(&pool.spec.name, &worker_tuples).await;
-                    }
+                    pm.assign_workers(&pool.spec.name, &worker_tuples).await;
                 }
             }
         });

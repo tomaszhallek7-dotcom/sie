@@ -11,6 +11,7 @@ from fastapi import FastAPI
 
 from sie_server.api.encode import router as encode_router
 from sie_server.api.extract import router as extract_router
+from sie_server.api.generate import router as generate_router
 from sie_server.api.health import router as health_router
 from sie_server.api.metrics import router as metrics_router
 from sie_server.api.models import router as models_router
@@ -34,6 +35,22 @@ from sie_server.observability.telemetry import telemetry_sender
 from sie_server.observability.tracing import setup_tracing
 
 logger = logging.getLogger(__name__)
+
+
+def _resolved_pool_name() -> str | None:
+    """Resolve the worker's pool identity from the environment.
+
+    Returns the ``SIE_POOL`` value (with ``"_default"`` fallback) when
+    cluster-queue routing is active, else ``None`` for the local
+    single-process serving path which has no pool semantics.
+
+    Shared by :meth:`AppFactory._registry_lifecycle` (registry
+    pool-isolation validator) and :meth:`AppFactory._nats_pull_loop`
+    (NATS pull loop) so the two cannot drift.
+    """
+    if os.environ.get("SIE_CLUSTER_ROUTING") != "queue":
+        return None
+    return os.environ.get("SIE_POOL", "_default")
 
 
 @asynccontextmanager
@@ -78,6 +95,7 @@ class AppFactory:
         app.include_router(health_router)
         app.include_router(encode_router)
         app.include_router(extract_router)
+        app.include_router(generate_router)
         app.include_router(score_router)
         app.include_router(models_router)
         app.include_router(metrics_router)
@@ -110,6 +128,15 @@ class AppFactory:
                 _timed_stage("model_registry", cls._model_registry(config)) as registry,
                 _timed_stage("nats_subscriber", cls._nats_subscriber(registry)) as nats_sub,
                 _timed_stage("nats_pull_loop", cls._nats_pull_loop(registry, nats_sub)) as pull_loop,
+                # Optional NATS health publisher. Off by default; flip
+                # SIE_HEALTH_NATS=1 to surface `saturated` (and the rest of the
+                # WorkerStatusMessage) over `sie.health.{worker_id}` in addition
+                # to the WS path. Started *after* the pull loop because it
+                # snapshots `pull_loop.update_saturation()` on every tick.
+                _timed_stage(
+                    "nats_health_publisher",
+                    cls._nats_health_publisher(registry, nats_sub, pull_loop),
+                ),
                 _timed_stage("graceful_shutdown", cls._graceful_shutdown(shutdown_state)),
                 _timed_stage("readiness", cls._readiness_handling()),
             ):
@@ -135,12 +162,18 @@ class AppFactory:
 
         models_dir = config.models_dir or str(engine_config.models_dir)
 
+        # Pass the worker's pool identity into the registry so
+        # the pool-isolation validator can reject mixed gen/non-gen pools
+        # at config-load time. Only set when SIE_CLUSTER_ROUTING=queue so
+        # local single-process serving (which has no pool semantics) keeps
+        # working without the check.
         registry = ModelRegistry(
             models_dir=models_dir,
             model_filter=config.model_filter,
             memory_config=memory_config,
             device=config.device,
             engine_config=engine_config,
+            pool_name=_resolved_pool_name(),
         )
         try:
             # Start background services (memory monitor, idle evictor, hot reload).
@@ -254,7 +287,12 @@ class AppFactory:
             raise RuntimeError("SIE_CLUSTER_ROUTING=queue but NATS connection is None — cannot start pull loop")
         js = nc.jetstream()
         bundle_id = os.environ.get("SIE_BUNDLE", "default")
-        pool_name = os.environ.get("SIE_POOL", "_default")
+        # Share resolution with the registry's pool isolation
+        # validator. ``_resolved_pool_name`` returns ``None`` outside
+        # ``SIE_CLUSTER_ROUTING=queue``, but we still need a pool string
+        # for the pull-loop subject naming inside this branch (we already
+        # know cluster routing is queue — this lifecycle only fires then).
+        pool_name = _resolved_pool_name() or os.environ.get("SIE_POOL", "_default")
         payload_store_url = os.environ.get("SIE_PAYLOAD_STORE_URL")
 
         pull_loop = NatsPullLoop(
@@ -276,6 +314,60 @@ class AppFactory:
             yield pull_loop
         finally:
             await pull_loop.stop()
+
+    @classmethod
+    @asynccontextmanager
+    async def _nats_health_publisher(
+        cls,
+        registry: ModelRegistry,
+        nats_subscriber: NatsSubscriber | None,
+        pull_loop: NatsPullLoop | None,
+    ) -> AsyncGenerator[object | None, None]:
+        """Optional periodic ``sie.health.{worker_id}`` publisher.
+
+        Opt-in via ``SIE_HEALTH_NATS=1``. Disabled by default because
+        the WebSocket ``/ws/status`` path is still the canonical
+        transport; the NATS path is parallel and runs at the same
+        cadence so the gateway sees consistent state from either
+        side. Requires the NATS connection from the subscriber and
+        the pull loop (for saturation). Gracefully no-ops if either
+        is missing.
+        """
+        from sie_server.health.nats_publisher import NatsHealthPublisher, is_enabled  # noqa: PLC0415
+
+        if not is_enabled():
+            yield None
+            return
+        nats_url = os.environ.get("SIE_NATS_URL")
+        if not nats_url or nats_subscriber is None or pull_loop is None:
+            logger.info(
+                "SIE_HEALTH_NATS=1 but prerequisites missing (url=%s, subscriber=%s, pull_loop=%s); "
+                "skipping NATS health publisher",
+                bool(nats_url),
+                nats_subscriber is not None,
+                pull_loop is not None,
+            )
+            yield None
+            return
+
+        # Build a closure that the publisher polls once per interval.
+        # We pull `pull_loop` directly so the `saturated` field is in
+        # lockstep with the gate state machine.
+        from sie_server.api.ws import build_status_message  # noqa: PLC0415
+
+        async def _snapshot() -> Any:
+            return await build_status_message(registry, pull_loop=pull_loop)
+
+        publisher = NatsHealthPublisher(
+            nats_url=nats_url,
+            worker_id=pull_loop.worker_id,
+            build_status=_snapshot,
+        )
+        await publisher.start()
+        try:
+            yield publisher
+        finally:
+            await publisher.stop()
 
     @classmethod
     @asynccontextmanager

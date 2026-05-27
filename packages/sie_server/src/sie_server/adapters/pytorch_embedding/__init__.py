@@ -91,6 +91,7 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         compute_precision: ComputePrecision = "bfloat16",
         attn_implementation: AttnImplementation = "sdpa",
         trust_remote_code: bool = True,
+        revision: str | None = None,
         query_template: str | None = None,
         doc_template: str | None = None,
         default_instruction: str | None = None,
@@ -113,6 +114,9 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
                 Use "eager" for models that don't support SDPA (e.g., Stella).
                 For typical retrieval workloads, SDPA is 20-25% faster.
             trust_remote_code: Whether to trust remote code in model files.
+            revision: Optional HuggingFace revision/branch/commit SHA to pin
+                when loading the tokenizer and model. If None, the default
+                branch is used. Forwarded to ``from_pretrained(..., revision=...)``.
             query_template: Template for formatting queries. Use {instruction} and
                 {text} placeholders. Example: "Instruct: {instruction}\nQuery: {text}"
                 If None, queries are passed as-is.
@@ -135,6 +139,7 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         self._compute_precision = compute_precision
         self._attn_implementation = attn_implementation
         self._trust_remote_code = trust_remote_code
+        self._revision = revision
         self._query_template = query_template
         self._doc_template = doc_template
         self._default_instruction = default_instruction
@@ -158,12 +163,13 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         dtype, attn_impl = self._resolve_dtype_and_attn(device)
 
         logger.info(
-            "Loading %s on device=%s with dtype=%s, attn=%s, pooling=%s",
+            "Loading %s on device=%s with dtype=%s, attn=%s, pooling=%s, revision=%s",
             self._model_name_or_path,
             device,
             dtype,
             attn_impl,
             self._pooling,
+            self._revision,
         )
 
         # Determine padding side based on pooling strategy
@@ -172,11 +178,17 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         hf_token = os.environ.get("HF_TOKEN")
 
         # Load tokenizer
+        shared_kwargs: dict[str, Any] = {
+            "trust_remote_code": self._trust_remote_code,
+            "token": hf_token,
+        }
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         self._tokenizer = AutoTokenizer.from_pretrained(
             self._model_name_or_path,
             padding_side=padding_side,
-            trust_remote_code=self._trust_remote_code,
-            token=hf_token,
+            **shared_kwargs,
         )
 
         # Load model with configured attention implementation
@@ -184,8 +196,7 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
             self._model_name_or_path,
             torch_dtype=dtype,
             attn_implementation=attn_impl,
-            trust_remote_code=self._trust_remote_code,
-            token=hf_token,
+            **shared_kwargs,
         )
         # Disable KV cache for models using the legacy transformers cache API
         if self._uses_legacy_transformers_cache:

@@ -30,6 +30,7 @@ from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
 from sie_server.core.inference_output import EncodeOutput
+from sie_server.types.inputs import media_bytes
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -223,7 +224,7 @@ class CLIPAdapter(BaseAdapter):
         pil_images = []
         for img_input in item.images or []:
             # img_input is ImageInput TypedDict with data (bytes) and optional format
-            img_bytes = img_input["data"]
+            img_bytes = media_bytes(img_input, kind="image")
             pil_img = Image.open(io.BytesIO(img_bytes))
             # Convert to RGB if necessary (CLIP expects RGB)
             if pil_img.mode != "RGB":

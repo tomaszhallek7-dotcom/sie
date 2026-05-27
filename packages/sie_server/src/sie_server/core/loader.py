@@ -15,6 +15,7 @@ from sie_sdk.storage import (
     join_path,
 )
 
+from sie_server.adapters._generation_base import GenerationAdapter
 from sie_server.adapters.base import ModelAdapter
 from sie_server.config.engine import ComputePrecision
 from sie_server.config.model import AdapterOptions, ModelConfig, ProfileConfig
@@ -305,6 +306,22 @@ def load_adapter(
         )
         raise ValueError(msg)
 
+    # If the config declares ``tasks.generate``, the resolved adapter MUST
+    # be a ``GenerationAdapter`` subclass. The outputs check above would
+    # catch any adapter that doesn't declare "tokens" in capabilities,
+    # but an embedding adapter that mistakenly declared "tokens" would
+    # slip through — this is the structural check. Surfacing the error
+    # at adapter-load (worker boot) rather than first-request time
+    # means misconfiguration is caught before any traffic lands.
+    if config.tasks.generate is not None and not isinstance(adapter, GenerationAdapter):
+        msg = (
+            f"Model '{config.sie_id}' declares 'tasks.generate' but adapter "
+            f"'{adapter_class.__name__}' is not a GenerationAdapter subclass. "
+            "Generation requests require an adapter that inherits from "
+            "sie_server.adapters._generation_base.GenerationAdapter."
+        )
+        raise ValueError(msg)
+
     return adapter
 
 
@@ -321,6 +338,8 @@ def _import_builtin_adapter(module_path: str, class_name: str) -> type[ModelAdap
     Raises:
         ImportError: If module or class not found.
     """
+    module_path = _resolve_legacy_adapter_module(module_path, class_name)
+
     try:
         module = importlib.import_module(module_path)
     except ImportError as e:
@@ -332,6 +351,15 @@ def _import_builtin_adapter(module_path: str, class_name: str) -> type[ModelAdap
         raise ImportError(msg)
 
     return getattr(module, class_name)
+
+
+def _resolve_legacy_adapter_module(module_path: str, class_name: str) -> str:
+    if module_path == "sie_server.adapters.sglang":
+        if class_name == "SGLangEmbeddingAdapter":
+            return "sie_server.adapters.sglang.embedding"
+        if class_name == "SGLangGenerationAdapter":
+            return "sie_server.adapters.sglang.generation"
+    return module_path
 
 
 def _import_custom_adapter(file_path: Path, class_name: str) -> type[ModelAdapter]:
@@ -418,6 +446,8 @@ def _build_adapter_kwargs(
         "max_seq_length": config.max_sequence_length,
         "compute_precision": compute_precision,
     }
+    if config.tasks.encode is not None and config.tasks.encode.dense is not None:
+        kwargs["dense_dim"] = config.tasks.encode.dense.dim
 
     # Pass HF revision if pinned in config
     if config.hf_revision is not None:

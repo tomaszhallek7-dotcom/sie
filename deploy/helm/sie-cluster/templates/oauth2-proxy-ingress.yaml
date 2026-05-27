@@ -1,4 +1,5 @@
 {{- if and .Values.auth.enabled .Values.ingress.enabled }}
+{{- $hosts := include "sie-cluster.ingress.hosts" . | fromJsonArray }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -15,15 +16,18 @@ spec:
   {{- if .Values.ingress.className }}
   ingressClassName: {{ .Values.ingress.className }}
   {{- end }}
-  {{- if and .Values.ingress.tls.enabled .Values.ingress.host }}
+  {{- if and .Values.ingress.tls.enabled $hosts }}
   tls:
     - hosts:
-        - {{ .Values.ingress.host }}
+        {{- range $hosts }}
+        - {{ . | quote }}
+        {{- end }}
       secretName: {{ .Values.ingress.tls.secretName }}
   {{- end }}
   rules:
-    - {{- if .Values.ingress.host }}
-      host: {{ .Values.ingress.host }}
+    {{- range (default (list "") $hosts) }}
+    - {{- if . }}
+      host: {{ . | quote }}
       {{- end }}
       http:
         paths:
@@ -31,7 +35,8 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: {{ include "sie-cluster.oauth2Proxy.serviceName" . }}
+                name: {{ include "sie-cluster.oauth2Proxy.serviceName" $ }}
                 port:
-                  number: {{ .Values.auth.oauth2Proxy.service.port }}
+                  number: {{ $.Values.auth.oauth2Proxy.service.port }}
+    {{- end }}
 {{- end }}

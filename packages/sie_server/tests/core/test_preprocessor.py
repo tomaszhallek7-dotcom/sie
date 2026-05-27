@@ -9,7 +9,7 @@ from PIL import Image
 from sie_server.core.prepared import ImagePayload, PreparedItem, TextPayload
 from sie_server.core.preprocessor import ImagePreprocessor, Preprocessor, TextPreprocessor
 from sie_server.core.preprocessor.image import OpenCLIPImagePreprocessor
-from sie_server.types.inputs import ImageInput, Item
+from sie_server.types.inputs import ImageInput, InvalidMediaError, Item
 
 
 class TestPreprocessorProtocol:
@@ -284,6 +284,21 @@ class TestImagePreprocessor:
         assert batch.total_cost == 1
         # Only item at index 1 has image
         assert batch.items[0].original_index == 1
+
+    def test_prepare_rejects_str_image_data(self, mock_processor, mock_config):
+        """Non-bytes image data raises a structured error (defense-in-depth, #1026).
+
+        An un-decoded base64 str on the queue path (where typed msgspec decoding
+        doesn't run) must raise InvalidMediaError, not a raw TypeError from
+        ``io.BytesIO(str)``.
+        """
+        preprocessor = ImagePreprocessor(mock_processor, "test-model")
+        # msgspec Structs don't validate on direct construction, so this mirrors
+        # how the worker builds an Item from an undecoded wire dict.
+        items = [Item(images=[{"data": "aGVsbG8=", "format": "png"}])]
+
+        with pytest.raises(InvalidMediaError, match="image data must be bytes, got str"):
+            preprocessor.prepare(items, config=mock_config)
 
     def test_prepare_rgba_conversion(self, mock_processor, mock_config):
         """RGBA images are converted to RGB."""

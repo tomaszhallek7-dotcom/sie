@@ -501,6 +501,7 @@ mod tests {
                     m.insert("l4-spot".to_string(), 2);
                     m
                 },
+                gpu_caps: HashMap::new(),
                 ttl_seconds: Some(600),
                 minimum_worker_count: 2,
             },
@@ -591,6 +592,7 @@ mod tests {
                     m.insert("l4-spot".to_string(), 1);
                     m
                 },
+                gpu_caps: HashMap::new(),
                 ttl_seconds: Some(300),
                 minimum_worker_count: 1,
             },

@@ -41,6 +41,7 @@ class TestAppFactory:
         paths = openapi["paths"]
 
         assert "/healthz" in paths
+        assert "/livez" in paths
         assert "/readyz" in paths
 
 

@@ -296,6 +296,21 @@ class TestLoadAdapter:
         # Should be the right type
         assert isinstance(adapter, SentenceTransformerDenseAdapter)
 
+    def test_load_bge_m3_flag_variant_with_dense_dim(self, tmp_path: Path) -> None:
+        """BGE-M3 Flag adapter accepts dense_dim supplied by loader."""
+        config = _make_config(
+            sie_id="BAAI/bge-m3:bge_m3_flag",
+            hf_id="BAAI/bge-m3",
+            adapter_path="sie_server.adapters.bge_m3_flag:BGEM3FlagAdapter",
+            dense_dim=1024,
+            sparse_dim=250002,
+            multivector_dim=1024,
+        )
+
+        adapter = load_adapter(config, tmp_path, device="cpu")
+
+        assert type(adapter).__name__ == "BGEM3FlagAdapter"
+
     def test_load_custom_adapter(self, tmp_path: Path) -> None:
         """Can load a custom adapter from file."""
         # Create custom adapter file

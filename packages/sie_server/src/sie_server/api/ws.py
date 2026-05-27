@@ -21,12 +21,14 @@ from sie_sdk.types import (
 )
 
 from sie_server.core.batcher import BatchConfig
+from sie_server.core.gpu_health import gpu_is_healthy_async
 from sie_server.core.readiness import is_ready
 from sie_server.observability.gpu import get_gpu_metrics
 from sie_server.observability.prometheus import collect_prometheus_metrics
 
 if TYPE_CHECKING:
     from sie_server.core.registry import ModelRegistry
+    from sie_server.nats_pull_loop import NatsPullLoop
 
 logger = logging.getLogger(__name__)
 
@@ -219,7 +221,10 @@ def compute_bundle_config_hash_cached(registry: ModelRegistry, bundle_id: str) -
     return result
 
 
-async def build_status_message(registry: ModelRegistry) -> WorkerStatusMessage:
+async def build_status_message(
+    registry: ModelRegistry,
+    pull_loop: NatsPullLoop | None = None,
+) -> WorkerStatusMessage:
     """Build the complete status message.
 
     Args:
@@ -273,8 +278,19 @@ async def build_status_message(registry: ModelRegistry) -> WorkerStatusMessage:
     machine_profile = os.environ.get("SIE_MACHINE_PROFILE") or gpu_type or ""
     pool_name = os.environ.get("SIE_POOL", "")
 
-    # Worker name: use hostname or pod name if available
-    worker_name = os.environ.get("HOSTNAME", os.environ.get("POD_NAME", ""))
+    # Worker name (== worker_id used by direct-dispatch routing).
+    #
+    # The pull loop owns the canonical resolution
+    # (``SIE_WORKER_ID > HOSTNAME > POD_NAME > uuid4``); we mirror that
+    # value here so the gateway's WorkerRegistry keys its dispatch
+    # subject (``sie.work.{model}.{pool}.{name}``) on the *same*
+    # identifier the worker is subscribed to. Falling back to the
+    # legacy ``HOSTNAME``/``POD_NAME`` lookup when the pull loop is
+    # absent keeps the non-queue path working unchanged.
+    if pull_loop is not None and hasattr(pull_loop, "worker_id"):
+        worker_name = pull_loop.worker_id
+    else:
+        worker_name = os.environ.get("SIE_WORKER_ID") or os.environ.get("HOSTNAME") or os.environ.get("POD_NAME", "")
 
     # Loaded models: list of model names with state="loaded"
     loaded_models = [m["name"] for m in model_status if m["state"] == "loaded"]
@@ -290,9 +306,37 @@ async def build_status_message(registry: ModelRegistry) -> WorkerStatusMessage:
     else:
         max_batch_requests = BatchConfig().max_batch_requests
 
+    # Ask the pull loop for its latched saturation flag. The
+    # pull loop owns the SaturationGate state machine; we drive an
+    # update here so the WS-emitted snapshot matches whatever the
+    # optional NATS health publisher sees on the same tick. Falls
+    # back to False when the pull loop is not present (eg. tests
+    # using `build_status_message` standalone).
+    #
+    # Admission-control note: the underlying ratio changed semantics. On
+    # generation pools (where a ``kv_budget_tokens`` is configured)
+    # the gate now reads ``kv_reserved / kv_budget`` regardless of
+    # whether admission is actually enabled. On non-generation pools
+    # it still reads ``in_flight / aggregate_max_batch_requests``.
+    # The boolean ``saturated`` is unchanged for consumers, but
+    # downstream alerts that previously assumed the pre-admission fraction
+    # should be aware of the switch — see
+    # :meth:`NatsPullLoop.update_saturation`.
+    if pull_loop is not None and hasattr(pull_loop, "update_saturation"):
+        saturated = bool(pull_loop.update_saturation())
+    else:
+        saturated = False
+
+    # The gateway routes only to workers reporting ready=True. Fold in GPU health
+    # so a wedged CUDA context (issue #1025) drops the worker from the routing
+    # pool instead of being reported healthy off stale in-memory model state.
+    # gpu_is_healthy_async runs the blocking probe off the event loop so this
+    # 200ms status loop never stalls inference; short-circuit skips it while the
+    # worker is draining (is_ready() False).
+    ready = is_ready() and await gpu_is_healthy_async()
     return WorkerStatusMessage(
         timestamp=time.time(),
-        ready=is_ready(),
+        ready=ready,
         name=worker_name,
         # Gateway-friendly fields
         machine_profile=machine_profile,
@@ -302,6 +346,7 @@ async def build_status_message(registry: ModelRegistry) -> WorkerStatusMessage:
         bundle_config_hash=bundle_config_hash,
         loaded_models=loaded_models,
         max_batch_requests=max_batch_requests,
+        saturated=saturated,
         # Detailed fields (for TUI, gateway model selection, debugging)
         # Note: queue_depth is per-model in models array, not aggregated
         server=server_info,
@@ -323,11 +368,15 @@ async def websocket_status(websocket: WebSocket) -> None:
 
     # Get registry from app state
     registry: ModelRegistry = websocket.app.state.registry
+    # Feed `build_status_message` the pull loop so it can
+    # populate the `saturated` flag. May be absent in stripped-down
+    # test apps; the helper handles `None` defensively.
+    pull_loop = getattr(websocket.app.state, "nats_pull_loop", None)
 
     try:
         while True:
             # Build and send status
-            status = await build_status_message(registry)
+            status = await build_status_message(registry, pull_loop=pull_loop)
             await websocket.send_json(status)
 
             # Wait 200ms before next update

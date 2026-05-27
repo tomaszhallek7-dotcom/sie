@@ -223,7 +223,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tools/loadtest_dashboard/scripts/*.py" = [
+"tools/sie_dashboard/scripts/*.py" = [
     "INP001",  # JS project subdir; not a Python package
 ]
 "**/tests/**/*" = [

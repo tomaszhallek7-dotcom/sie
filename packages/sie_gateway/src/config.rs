@@ -119,6 +119,37 @@ fn env_csv(key: &str) -> Vec<String> {
     }
 }
 
+fn env_json_string_map(key: &str) -> HashMap<String, String> {
+    match env::var(key) {
+        Ok(s) if !s.trim().is_empty() => {
+            serde_json::from_str::<HashMap<String, String>>(&s).unwrap_or_default()
+        }
+        _ => HashMap::new(),
+    }
+}
+
+fn build_gpu_profile_map(
+    configured_gpus: &[String],
+    aliases: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = configured_gpus
+        .iter()
+        .map(|g| (g.to_lowercase(), g.clone()))
+        .collect();
+
+    for (alias, profile) in aliases {
+        let alias = alias.trim();
+        let profile = profile.trim();
+        if alias.is_empty() || profile.is_empty() {
+            continue;
+        }
+        map.entry(alias.to_lowercase())
+            .or_insert_with(|| profile.to_string());
+    }
+
+    map
+}
+
 fn env_default(key: &str, fallback: &str) -> String {
     match env::var(key) {
         Ok(v) if !v.is_empty() => v,
@@ -132,6 +163,11 @@ impl Config {
         if auth_tokens.is_empty() {
             auth_tokens = env_csv("SIE_AUTH_TOKEN");
         }
+        let configured_gpus = env_csv("SIE_GATEWAY_CONFIGURED_GPUS");
+        let gpu_profile_map = build_gpu_profile_map(
+            &configured_gpus,
+            env_json_string_map("SIE_GATEWAY_GPU_ALIASES"),
+        );
 
         Self {
             host: "0.0.0.0".to_string(),
@@ -177,11 +213,8 @@ impl Config {
             request_timeout: env_float("SIE_GATEWAY_REQUEST_TIMEOUT", 30.0),
             max_stream_pending: env_u64("SIE_GATEWAY_MAX_STREAM_PENDING", 50_000),
 
-            configured_gpus: env_csv("SIE_GATEWAY_CONFIGURED_GPUS"),
-            gpu_profile_map: {
-                let gpus = env_csv("SIE_GATEWAY_CONFIGURED_GPUS");
-                gpus.iter().map(|g| (g.to_lowercase(), g.clone())).collect()
-            },
+            configured_gpus,
+            gpu_profile_map,
 
             bundles_dir: env_default("SIE_BUNDLES_DIR", "bundles"),
             models_dir: env_default("SIE_MODELS_DIR", "models"),
@@ -444,6 +477,57 @@ mod tests {
         with_env(&[("_TEST_CSV", "a,,b,")], || {
             assert_eq!(env_csv("_TEST_CSV"), vec!["a", "b"]);
         });
+    }
+
+    #[test]
+    fn test_env_json_string_map() {
+        with_env(&[("_TEST_JSON_MAP", r#"{"l4":"l4-spot"}"#)], || {
+            let result = env_json_string_map("_TEST_JSON_MAP");
+            assert_eq!(result.get("l4"), Some(&"l4-spot".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_env_json_string_map_invalid_is_empty() {
+        with_env(&[("_TEST_JSON_MAP", "not-json")], || {
+            assert!(env_json_string_map("_TEST_JSON_MAP").is_empty());
+        });
+    }
+
+    #[test]
+    fn test_build_gpu_profile_map_preserves_canonical_and_aliases() {
+        let mut aliases = HashMap::new();
+        aliases.insert("l4".to_string(), "l4-spot".to_string());
+
+        let result = build_gpu_profile_map(&["l4-spot".to_string()], aliases);
+
+        assert_eq!(result.get("l4-spot"), Some(&"l4-spot".to_string()));
+        assert_eq!(result.get("l4"), Some(&"l4-spot".to_string()));
+    }
+
+    #[test]
+    fn test_build_gpu_profile_map_does_not_override_canonical_profile() {
+        let mut aliases = HashMap::new();
+        aliases.insert("l4".to_string(), "l4-spot".to_string());
+
+        let result = build_gpu_profile_map(&["l4".to_string(), "l4-spot".to_string()], aliases);
+
+        assert_eq!(result.get("l4"), Some(&"l4".to_string()));
+    }
+
+    #[test]
+    fn test_config_load_uses_gpu_aliases() {
+        with_env(
+            &[
+                ("SIE_GATEWAY_CONFIGURED_GPUS", "l4-spot"),
+                ("SIE_GATEWAY_GPU_ALIASES", r#"{"l4":"l4-spot"}"#),
+            ],
+            || {
+                let cfg = Config::load();
+                assert_eq!(cfg.configured_gpus, vec!["l4-spot"]);
+                assert_eq!(cfg.gpu_profile_map.get("l4"), Some(&"l4-spot".to_string()));
+            },
+        );
     }
 
     // ── env_default ────────────────────────────────────────────────

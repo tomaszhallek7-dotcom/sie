@@ -8,7 +8,7 @@
 //! this layer.
 //!
 //! Only inference endpoints (`/v1/encode/*`, `/v1/score/*`,
-//! `/v1/extract/*`, `/v1/embeddings`) populate `sie_gateway_requests_total` +
+//! `/v1/extract/*`, `/v1/generate/*`, `/v1/embeddings`) populate `sie_gateway_requests_total` +
 //! `sie_gateway_request_latency_seconds`. Infrastructure paths
 //! (`/health*`, `/metrics`, `/ws/*`, `/v1/configs/*`, `/v1/pools`,
 //! `/v1/models`) are intentionally skipped: they are not traffic, and
@@ -164,7 +164,7 @@ where
     }
 }
 
-/// Return the endpoint label (`encode`, `score`, `extract`, `embeddings`) when the
+/// Return the endpoint label (`encode`, `score`, `extract`, `generate`, `embeddings`) when the
 /// path matches an inference route, otherwise `None`. Non-inference
 /// paths are intentionally excluded — see module-level docs.
 ///
@@ -178,6 +178,8 @@ fn classify_endpoint(path: &str) -> Option<&'static str> {
         Some("score")
     } else if path.starts_with("/v1/extract/") {
         Some("extract")
+    } else if path.starts_with("/v1/generate/") {
+        Some("generate")
     } else if path == "/v1/embeddings" {
         Some("embeddings")
     } else {
@@ -454,6 +456,10 @@ mod tests {
         assert_eq!(classify_endpoint("/v1/encode/org/model"), Some("encode"));
         assert_eq!(classify_endpoint("/v1/score/org/model"), Some("score"));
         assert_eq!(classify_endpoint("/v1/extract/org/model"), Some("extract"));
+        assert_eq!(
+            classify_endpoint("/v1/generate/org/model"),
+            Some("generate")
+        );
         assert_eq!(classify_endpoint("/v1/embeddings"), Some("embeddings"));
         assert_eq!(classify_endpoint("/health"), None);
         assert_eq!(classify_endpoint("/healthz"), None);

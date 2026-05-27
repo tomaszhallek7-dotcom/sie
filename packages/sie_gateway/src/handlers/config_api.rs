@@ -808,6 +808,7 @@ mod tests {
             memory_total_bytes: Some(0),
             gpus: Vec::new(),
             pool_name: String::new(),
+            saturated: false,
         }
     }
 

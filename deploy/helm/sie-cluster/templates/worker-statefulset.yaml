@@ -2,6 +2,12 @@
 {{- range $poolName, $pool := .Values.workers.pools }}
 {{- if $pool.enabled }}
 {{- $bundle := default $root.Values.workers.common.bundle $pool.bundle }}
+{{- /* imageBundle decouples the image-tag suffix from the logical bundle name.
+       Defaults to $bundle, but pools whose logical bundle has no dedicated
+       Docker image (e.g. `sglang-embedding`, which shares deps and image with
+       `sglang`) set this to the bundle whose image they reuse. Labels, env
+       vars, --bundle flag, and metrics still use $bundle. */ -}}
+{{- $imageBundle := default $bundle (default $root.Values.workers.common.imageBundle $pool.imageBundle) }}
 {{- $platform := default $root.Values.workers.common.platform $pool.platform }}
 {{- $machineProfile := default $pool.gpuType $pool.machineProfile }}
 {{- $queuePool := default (default "default" $root.Values.workers.common.queuePool) $pool.queuePool }}
@@ -55,7 +61,7 @@ spec:
       containers:
         - name: worker
           {{- $imageTag := default $root.Chart.AppVersion $root.Values.workers.common.image.tag }}
-          image: {{ printf "%s:%s-%s-%s" $root.Values.workers.common.image.repository $imageTag $platform $bundle }}
+          image: {{ printf "%s:%s-%s-%s" $root.Values.workers.common.image.repository $imageTag $platform $imageBundle }}
           imagePullPolicy: {{ $root.Values.workers.common.image.pullPolicy }}
           args:
             - serve
@@ -118,6 +124,15 @@ spec:
               value: {{ $root.Values.clusterRouting | quote }}
             - name: SIE_POOL
               value: {{ $queuePool | quote }}
+            - name: SIE_GATEWAY_URL
+              value: {{ include "sie-cluster.gateway.internalUrl" $root | quote }}
+            {{- if $root.Values.gateway.auth.tokenSecretName }}
+            - name: SIE_GATEWAY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.gateway.auth.tokenSecretName }}
+                  key: {{ $root.Values.gateway.auth.tokenSecretKey }}
+            {{- end }}
             {{- with $root.Values.queueRouting }}
             - name: SIE_NAK_DELAY_S
               value: {{ .nakDelaySec | default 5 | quote }}
@@ -127,6 +142,14 @@ spec:
               value: {{ .streamMaxAgeSec | default 120 | quote }}
             - name: SIE_NATS_FETCH_BUDGET
               value: {{ .natsFetchBudget | default 64 | quote }}
+            {{- with .poolAdmission }}
+            - name: SIE_POOL_ADMISSION_CHECK_INTERVAL_S
+              value: {{ .checkIntervalSec | default 10 | quote }}
+            - name: SIE_POOL_ADMISSION_PAUSE_S
+              value: {{ .pauseSec | default 1 | quote }}
+            - name: SIE_POOL_ADMISSION_STALE_AFTER_S
+              value: {{ .staleAfterSec | default 30 | quote }}
+            {{- end }}
             {{- end }}
             {{- end }}
             {{- $payloadStoreUrl := include "sie-cluster.payloadStoreUrl" $root }}
@@ -163,8 +186,12 @@ spec:
               port: http
             {{- toYaml $root.Values.workers.common.probes.startup | nindent 12 }}
           livenessProbe:
+            # /livez is GPU-aware: it runs a tiny CUDA sync so a wedged context
+            # (device-side assert) escalates to a pod restart instead of serving
+            # 500s forever. /healthz (startupProbe) stays process-alive only.
+            # CPU workers report healthy from /livez, so this is safe for all pools.
             httpGet:
-              path: /healthz
+              path: /livez
               port: http
             {{- toYaml $root.Values.workers.common.probes.liveness | nindent 12 }}
           readinessProbe:

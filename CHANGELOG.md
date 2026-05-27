@@ -1,5 +1,114 @@
 # Changelog
 
+## v0.4.0
+
+- chore(main): release 0.4.0
+- chore(release-docker): scrub overcommenting and internal-naming leaks
+- fix(gateway): add NATS config trusted producers helm override
+- ci(release-docker): pre-bake sie-deps base images keyed on lockhash
+- chore(release): drop cuda11 from docker build matrix
+- fix(helm/sie-cluster): guard validateTls probe against deployments with nil labels
+- feat(openapi): add tool_calls support to chat completion schema
+- style: format code to comply with line length limits
+- fix(gateway): document ModelCapabilities in OpenAPI + refresh on profile delta-update
+- fix(gateway): scope LoRA adapter capabilities per profile (M10)
+- fix(generation): cancel tombstone prevents first-chunk fallback double-execution (H9)
+- feat(gateway): /v1/generate accepts seed/logprobs/logit_bias/n/best_of/lora_adapter (M8)
+- docs(openapi): rewrite schema to match implemented chat/completions/responses surface (M2)
+- fix(helm/sie-cluster): probe cert-manager controllers cluster-wide
+- fix(helm/sie-cluster): include cert-manager mode in presence-check gate
+- fix(helm/sie-cluster): label-based cert-manager detection + bidirectional runtime check
+- fix(helm/sie-cluster): one-step bundled cert-manager install with self-signed TLS
+- docs(generation): A100 Outlines smoke closes H10 release gate
+- fix(streaming): no-silent-drop on chunk-queue backpressure (H6)
+- feat(gateway+worker): per-choice OpenAI streaming for n>1 (H4, H5, M4)
+- docs(product): commit generation as 4th supported primitive (M3, M9)
+- feat(gateway): add routing salt + byte-preserving key mode (M11)
+- fix(gateway): tighten chat sampler/token-cap + tool-history validation (M1, M13)
+- feat(worker): SGLang owns grammar; worker preflight opt-in only (H8, ADR-0002)
+- fix: centralize worker_id subject normalization (M5)
+- docs(generation): reconcile Qwen3.5 grammar-backend evidence (H10)
+- fix(gateway): strict allow-list + 400 contract on /v1/responses (H2)
+- fix(gateway): strict allow-list + 400 contract on /v1/completions (H3)
+- feat(python-sdk): expose typed params for chat n/logprobs/lora_adapter/etc (M7)
+- feat(ts-sdk): handle 202 provisioning in chatCompletions + expose missing fields (H1+M6)
+- fix(gateway): generation timeouts bypass legacy request-timeout ceiling (H7)
+- fix(generation): tighten lossy tool-control flags (M14)
+- chore(lora): rename "LoRA-on-generation exclusion" to "legacy scalar lora_id"
+- Fix async pool create delete races
+- Await in-flight async pool creation
+- Address pool admission review comments
+- Fix pool admission cap semantics
+- Fix pool cap admission semantics
+- fix(ci): copy assets/ into the gateway Docker build (redoc bundle)
+- feat(gateway): /v1/completions streaming (text_completion SSE)
+- feat(gateway): /v1/responses structured array input (conversation history)
+- feat(generation): streaming n>1 — per-candidate SSE interleave
+- feat(gateway): accept OpenAI multimodal content-parts; reject images (no VL model)
+- feat(gateway): /v1/responses (OpenAI Responses API, MVP)
+- feat(gateway): advertise lora_adapters on /v1/models + pre-validate unknown names
+- feat(generation): best_of — over-generate + rank by logprob, return top n
+- feat(gateway): /v1/completions (legacy OpenAI Completions, raw-prompt)
+- feat(worker): wire mixed-pool fairness scheduler into the pull-loop (opt-in)
+- Revert "feat(gateway)!: fail-closed authentication (default-deny)"
+- Revert "fix(dev): set explicit auth opt-in for local gateway launchers (post fail-closed)"
+- Enable cloud log observability overlays
+- fix(generation): LoRA lora_path is a top-level /generate field, not a sampling param
+- feat(generation): multi-LoRA serving (one base, N adapters, per-request) (roadmap 6.2)
+- Disable cloud log observability by default
+- Sync Helm dependency lock
+- feat(generation): multi-candidate n>1 (non-streaming) end-to-end (roadmap 1.5)
+- Enable cloud Loki Alloy overlays
+- Add Loki Alloy log observability
+- fix(dev): set explicit auth opt-in for local gateway launchers (post fail-closed)
+- feat(gateway): register /v1/moderations as explicit 501 (roadmap 1.8, phase 3)
+- feat(gateway): meaningful system_fingerprint on chat responses (roadmap 1.3/§5)
+- feat(worker): WorkClassScheduler core for mixed-pool fairness (roadmap §6.1)
+- fix(chart): pin image-prepull DaemonSets to GPU nodes
+- feat(routing): cache-aware (prefix-hash) routing (roadmap §6.3)
+- feat(gateway)!: fail-closed authentication (default-deny)
+- feat(chat): regex/EBNF response_format + developer role (roadmap 1.7)
+- docs: reconcile structured-output backend + fix chat-param docstring drift
+- feat(gateway): serve a rendered API reference at /docs (Redoc)
+- feat(gateway): unify /v1/embeddings on the OpenAI error envelope (roadmap 1.4)
+- chore(openapi): regenerate server spec for GPU-aware health probes
+- fix(server,gateway): add GPU-aware health probes to detect and recover from wedged CUDA contexts
+- fix(sie_server): install cv2 system libs for docling extract
+- fix(sie_server): enforce media bytes contract at every consumer (#1026)
+- fix(sie_server): base64-decode JSON image inputs (#1026)
+- feat(gateway,sdk,server): add OpenAI-compatible chat completions with streaming and sampling extensions
+- fix(grammar): resolve tokenizer adapter for Outlines processor factories and remove anchors from regex patterns
+- test(metrics): update api_key masking assertion and add clarifying comment
+- fix(gateway,sdk,server): validate numeric fields and improve error handling
+- refactor(gateway,sdk,server): harden request routing, dedup, and resource cleanup
+- fix(gateway,sdk,server): prevent metric cardinality DoS and fix non-idempotent retry logic
+- refactor(gateway,server): improve OpenAI compatibility and fix Docker build caching
+- feat(gateway,server): add multi-turn tool-use support with OpenAI-compatible message format
+- fix(helm/sie-cluster): regenerate Chart.lock with synced digest
+- fix(helm/sie-cluster): make self-signed root-CA namespace configurable
+- feat(helm/sie-cluster): bundle cert-manager + trust-manager (opt-in) with self-signed TLS mode
+- chore(helm): decouple worker image bundle from logical bundle configuration
+- fix(helm): trim and drop empty entries in ingress.hosts
+- refactor(sdk,server,observability): simplify sampling parameter handling and fix concurrent HTTP client initialization
+- fix(gateway,sdk,server): add wire-level validation, improve resource cleanup, and enhance observability across request lifecycle
+- fix(gateway,sdk,server): strengthen validation and eliminate silent failures across request lifecycle
+- feat(gateway,sdk,server): add native generate endpoint with improved admission control and validation
+- feat(gateway): refactor streaming and routing with improved error handling and metrics
+- build(gateway): add BSL-1.0 to allowed licenses in deny configuration
+- chore: regenerate OpenAPI spec
+- feat(generation): complete M4 req2 generation primitive with streaming, structured outputs, and routing
+- Support configurable ingress.hosts in sie-cluster chart
+- refactor(observability): add grammar label to TTFT/TPOT metrics and extend dashboard instrumentation
+- feat(gateway,server): add HRW direct-dispatch routing with saturation-aware admission control
+- refactor(routing): implement slice 05 HRW direct-dispatch with saturation-aware worker selection
+- feat(gateway): implement slice 04 structured-output grammar validation and compilation
+- feat: generate slice 03 chat completions + OpenAI error envelope
+- feat(observability): implement generation POC metrics and dashboard (slice 07)
+- feat: generate slice 08 gated validation trench
+- fix(pytorch_embedding): accept and forward revision kwarg (#876)
+- feat: generate slice 02 streaming async iterator
+- feat: generate slice 01 walking skeleton
+
 ## v0.3.4
 
 - chore(main): release 0.3.4

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgpack
@@ -966,6 +967,180 @@ class TestReactiveModelLoading:
         assert task_cancelled
         assert len(loop._load_tasks) == 0
         assert len(loop._loading_models) == 0
+
+
+class TestGenerationDecoupledFromBatchSem:
+    """H2 regression: generation streams must NOT be capped by ``_batch_sem``.
+
+    Generation is decoupled from the GPU-batch semaphore — each stream
+    runs as its own tracked task and ``_batch_sem`` is released once the
+    batch is dispatched. KV admission (inside StreamingProcessor) is the
+    real backpressure. Without the fix, no more than
+    ``_MAX_CONCURRENT_BATCHES`` (=4) generation streams could be in flight.
+    """
+
+    @pytest.mark.asyncio
+    async def test_more_than_max_batches_generation_streams_in_flight(self) -> None:
+        nc = AsyncMock()
+        registry = MagicMock()
+        registry.model_names = ["test/model"]
+        registry.get_config.return_value = MagicMock()
+        registry.is_loaded.return_value = True
+
+        loop = _make_loop(nc=nc, registry=registry)
+        # Per-model budget large enough to dispatch all messages in one batch.
+        loop._get_batch_budget = MagicMock(return_value=256)  # type: ignore[method-assign]
+
+        n_streams = _MAX_CONCURRENT_BATCHES * 3  # 12 — well past the old cap
+        concurrent = 0
+        peak_concurrent = 0
+        release = asyncio.Event()
+
+        async def slow_stream(msg: Any, model_id: str) -> None:
+            nonlocal concurrent, peak_concurrent
+            concurrent += 1
+            peak_concurrent = max(peak_concurrent, concurrent)
+            try:
+                await release.wait()
+            finally:
+                concurrent -= 1
+
+        loop._streaming_processor.process = AsyncMock(side_effect=slow_stream)  # type: ignore[method-assign]
+
+        messages = []
+        for i in range(n_streams):
+            m = _make_msg(
+                _make_work_item(
+                    work_item_id=f"req-{i}.0",
+                    request_id=f"req-{i}",
+                    item_index=0,
+                    operation="generate",
+                    generate={"prompt": "hi", "max_new_tokens": 8},
+                )
+            )
+            # ``_dispatch_batch`` extracts model_id from the subject
+            # (``sie.work.{normalized}.{pool}``); set a real string so the
+            # AsyncMock attribute isn't a coroutine.
+            m.subject = "sie.work.test__model._default"
+            messages.append(m)
+
+        # Dispatch through the real ``_dispatch_batch`` so ``_batch_sem`` is
+        # exercised exactly as in production.
+        await loop._dispatch_batch(messages)
+
+        # ``_dispatch_batch`` schedules ``_guarded_process`` as a task; let
+        # it run ``_process_messages`` -> ``_process_generate_items`` which
+        # spawns the per-stream tasks and returns immediately, and let the
+        # guarded task unwind so it releases ``_batch_sem``.
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if peak_concurrent >= n_streams and loop._batch_sem._value == _MAX_CONCURRENT_BATCHES:
+                break
+
+        # All streams are concurrently in flight — NOT capped at 4 — while
+        # the streams are STILL running (release not set). This is the core
+        # property: generation concurrency exceeds _MAX_CONCURRENT_BATCHES.
+        assert not release.is_set()
+        assert peak_concurrent == n_streams, (
+            f"expected {n_streams} concurrent generation streams, "
+            f"got peak={peak_concurrent} (still capped by _batch_sem?)"
+        )
+        assert concurrent == n_streams, "streams should still be running (release not set)"
+        # The streams are tracked for graceful drain.
+        assert len(loop._in_flight_generate_tasks) == n_streams
+        # ``_batch_sem`` was released once the batch dispatched (NOT when the
+        # streams finish) — so it is back to full even though n_streams >
+        # _MAX_CONCURRENT_BATCHES streams are still in flight.
+        assert loop._batch_sem._value == _MAX_CONCURRENT_BATCHES
+
+        # Cleanup: release the streams and let the tasks finish.
+        release.set()
+        await asyncio.gather(*tuple(loop._in_flight_generate_tasks), return_exceptions=True)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_generate_streams_drained_on_stop(self) -> None:
+        """stop() drains in-flight generation streams (graceful shutdown)."""
+        nc = AsyncMock()
+        js = AsyncMock()
+        registry = MagicMock()
+        registry.model_names = ["test/model"]
+        registry.get_config.return_value = MagicMock()
+
+        loop = _make_loop(nc=nc, js=js, registry=registry)
+        loop._running = True
+        loop._pull_task = None
+
+        completed = False
+
+        async def slow_stream() -> None:
+            nonlocal completed
+            await asyncio.sleep(0.05)
+            completed = True
+
+        task = asyncio.create_task(slow_stream())
+        loop._in_flight_generate_tasks.add(task)
+        task.add_done_callback(loop._in_flight_generate_tasks.discard)
+
+        await loop.stop()
+
+        assert completed
+        assert len(loop._in_flight_generate_tasks) == 0
+
+
+class TestGenerateDispatchExceptionHandling:
+    """BUG 3 regression: an unexpected exception escaping
+    ``StreamingProcessor.process`` must NOT leave the JetStream message
+    unsettled (→ redelivery storm + KV leak) nor surface as an
+    unobserved-task-exception. The dispatch wrapper must NAK the message and
+    log/observe the exception.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unhandled_process_exception_naks_and_is_observed(self, caplog: pytest.LogCaptureFixture) -> None:
+        nc = AsyncMock()
+        registry = MagicMock()
+        registry.model_names = ["test/model"]
+        registry.get_config.return_value = MagicMock()
+        registry.is_loaded.return_value = True
+
+        loop = _make_loop(nc=nc, registry=registry)
+
+        # Make the REAL ``process`` run but force an internal failure: any
+        # exception beyond the ``msgpack.unpackb`` guard escapes ``process``.
+        # Monkeypatch ``_process_inner`` (called inside ``process`` after the
+        # span opens) to raise.
+        async def _boom(*_a: Any, **_k: Any) -> None:
+            raise RuntimeError("kaboom-internal")
+
+        loop._streaming_processor._process_inner = _boom  # type: ignore[method-assign]
+
+        msg = _make_msg(
+            _make_work_item(
+                operation="generate",
+                generate={"prompt": "hi", "max_new_tokens": 8},
+            )
+        )
+
+        with caplog.at_level(logging.ERROR):
+            await loop._process_generate_items("test/model", [(_make_work_item(operation="generate"), msg)])
+            # Let the dispatched task run to completion.
+            tasks = tuple(loop._in_flight_generate_tasks)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # The dispatched task must NOT propagate the exception (it's handled
+        # in the wrapper) — so gather sees clean results, not the RuntimeError.
+        assert all(not isinstance(r, BaseException) for r in results), (
+            f"exception escaped the dispatch wrapper (unobserved): {results!r}"
+        )
+        # The message was NAK'd for redelivery (not silently dropped).
+        msg.nak.assert_awaited()
+        msg.ack.assert_not_awaited()
+        # The exception was logged/observed.
+        assert any("kaboom-internal" in rec.getMessage() or rec.exc_info for rec in caplog.records), (
+            "expected the unhandled exception to be logged"
+        )
 
 
 class TestPayloadStoreFactory:

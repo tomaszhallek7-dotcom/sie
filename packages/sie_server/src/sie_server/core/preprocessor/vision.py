@@ -25,6 +25,7 @@ from sie_server.core.prepared import (
     PreparedItem,
 )
 from sie_server.core.preprocessor.base import get_image_executor
+from sie_server.types.inputs import media_bytes
 
 if TYPE_CHECKING:
     from sie_server.config.model import ModelConfig
@@ -241,7 +242,7 @@ class NemoColEmbedPreprocessor:
 
             # Load image from bytes
             img_input = item.images[0]
-            pil_img = PILImage.open(io.BytesIO(img_input["data"]))
+            pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
             original_size = pil_img.size
 
             # Convert to RGB if needed
@@ -447,7 +448,7 @@ class Florence2Preprocessor:
 
         # Load image from bytes - PIL releases GIL during decode
         img_input = item.images[0]
-        pil_img = PILImage.open(io.BytesIO(img_input["data"]))
+        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
         original_size = (pil_img.width, pil_img.height)
 
         # Convert to RGB if needed
@@ -642,7 +643,7 @@ class DonutPreprocessor:
 
         # Load image from bytes - PIL releases GIL during decode
         img_input = item.images[0]
-        pil_img = PILImage.open(io.BytesIO(img_input["data"]))
+        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
         original_size = (pil_img.width, pil_img.height)
 
         # Convert to RGB if needed
@@ -853,7 +854,7 @@ class LightOnOCRPreprocessor:
             return None
 
         img_input = item.images[0]
-        pil_img = PILImage.open(io.BytesIO(img_input["data"]))
+        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
         original_size = (pil_img.width, pil_img.height)
 
         if pil_img.mode != "RGB":
@@ -1034,7 +1035,7 @@ class GlmOcrPreprocessor:
             return None
 
         img_input = item.images[0]
-        pil_img = PILImage.open(io.BytesIO(img_input["data"]))
+        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
         original_size = (pil_img.width, pil_img.height)
 
         if pil_img.mode != "RGB":
@@ -1207,19 +1208,15 @@ class DetectionPreprocessor:
         """
         from PIL import Image as PILImage
 
-        from sie_server.types.inputs import is_image_input
-
         if not item.images:
             logger.warning("DetectionPreprocessor: item %d has no images", index)
             return None
 
         img = item.images[0]
-        if not is_image_input(img):
-            logger.warning("DetectionPreprocessor: item %d has non-ImageInput image", index)
-            return None
-
-        # Load image from bytes - PIL releases GIL during decode
-        pil_img = PILImage.open(io.BytesIO(img["data"]))
+        # Load image from bytes - PIL releases GIL during decode. media_bytes
+        # raises InvalidMediaError (-> 400 INVALID_INPUT) on a non-bytes payload
+        # rather than silently dropping the item or hitting a raw TypeError.
+        pil_img = PILImage.open(io.BytesIO(media_bytes(img, kind="image")))
         original_size = (pil_img.width, pil_img.height)
 
         # Convert to RGB if needed
@@ -1397,7 +1394,7 @@ class PaddleOCRVLPreprocessor:
             return None
 
         img_input = item.images[0]
-        pil_img = PILImage.open(io.BytesIO(img_input["data"]))
+        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
         original_size = (pil_img.width, pil_img.height)
 
         if pil_img.mode != "RGB":

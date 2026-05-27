@@ -101,7 +101,7 @@ class TestRecordRequest:
                 status="success",
                 timing=timing,
                 request_id="req-abc",
-                api_key="sk-***",
+                api_key="sk-secret-1234",
                 queue_depth=3,
             )
 
@@ -112,7 +112,9 @@ class TestRecordRequest:
         assert rec.endpoint == "encode"  # type: ignore
         assert rec.status == "success"  # type: ignore
         assert rec.request_id == "req-abc"  # type: ignore
-        assert rec.api_key == "sk-***"  # type: ignore
+        # record_request masks defensively: raw keys are never logged, only the
+        # last 4 chars survive (see _mask_secret).
+        assert rec.api_key == "***1234"  # type: ignore
         assert rec.queue_depth == 3  # type: ignore
         assert rec.latency_ms == 50.0  # type: ignore
         assert rec.tokenization_ms == 10.0  # type: ignore

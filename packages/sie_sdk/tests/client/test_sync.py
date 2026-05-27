@@ -37,6 +37,30 @@ class TestSIEClientInit:
             assert call_kwargs["headers"]["Authorization"] == "Bearer secret"
             client.close()
 
+    def test_create_pool_duplicate_posts_update_without_duplicate_renewal(self) -> None:
+        mock_response = MagicMock()
+        mock_response.status_code = 201
+        mock_response.json.return_value = {"status": {"state": "active"}}
+        thread = MagicMock()
+
+        with (
+            patch("sie_sdk.client.sync.httpx.Client") as mock_client,
+            patch("sie_sdk.client.sync.threading.Thread", return_value=thread) as thread_cls,
+        ):
+            mock_client.return_value.post.return_value = mock_response
+            client = SIEClient("http://localhost:8080")
+            try:
+                client.create_pool("my-pool", gpus={"l4": 1})
+                client.create_pool("my-pool", gpus={"l4": 1})
+
+                assert mock_client.return_value.post.call_count == 2
+                assert thread_cls.call_count == 1
+                thread.start.assert_called_once()
+                assert len(client._pools) == 1
+            finally:
+                client._pools.clear()
+                client.close()
+
     def test_trailing_slash_removed(self) -> None:
         """Base URL trailing slash is removed."""
         with patch("sie_sdk.client.sync.httpx.Client") as mock_client:

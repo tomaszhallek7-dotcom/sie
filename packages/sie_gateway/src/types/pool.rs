@@ -20,27 +20,29 @@ impl std::fmt::Display for PoolState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PoolSpec {
     pub name: String,
     #[serde(default)]
     pub bundle: Option<String>,
     #[serde(default)]
     pub gpus: HashMap<String, u32>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub gpu_caps: HashMap<String, u32>,
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
     #[serde(default)]
     pub minimum_worker_count: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct AssignedWorker {
     pub name: String,
     pub url: String,
     pub gpu: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct PoolStatus {
     pub state: PoolState,
     #[serde(default)]
@@ -62,7 +64,7 @@ impl Default for PoolStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Pool {
     pub spec: PoolSpec,
     pub status: PoolStatus,
@@ -100,6 +102,7 @@ mod tests {
                 name: "test".into(),
                 bundle: None,
                 gpus: HashMap::new(),
+                gpu_caps: HashMap::new(),
                 ttl_seconds: None,
                 minimum_worker_count: 0,
             },

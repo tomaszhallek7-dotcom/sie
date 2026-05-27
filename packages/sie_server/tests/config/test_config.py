@@ -8,6 +8,8 @@ from sie_server.config.model import (
     EmbeddingDim,
     EncodeTask,
     ExtractTask,
+    GenerateCapabilities,
+    GenerateTask,
     InputModalities,
     ModelConfig,
     ProfileConfig,
@@ -382,6 +384,53 @@ class TestModelConfig:
         assert config.tasks.extract is not None
         assert "json" in config.outputs
 
+    def test_generate_task_accepted(self) -> None:
+        """ModelConfig with the walking-skeleton generate task validates and exposes 'tokens' output."""
+        config = ModelConfig(
+            sie_id="Qwen/Qwen3-4B-Instruct",
+            hf_id="Qwen/Qwen3-4B-Instruct",
+            tasks=Tasks(
+                generate=GenerateTask(
+                    context_length=32768,
+                    max_output_tokens=4096,
+                    capabilities=GenerateCapabilities(grammar=[], streaming=True, tools=False),
+                ),
+            ),
+            profiles={
+                "default": ProfileConfig(
+                    adapter_path="sie_server.adapters.sglang:SGLangGenerationAdapter",
+                    max_batch_tokens=16384,
+                    kv_budget_tokens=8192,
+                ),
+            },
+        )
+        assert config.tasks.generate is not None
+        assert config.tasks.generate.context_length == 32768
+        assert config.tasks.generate.max_output_tokens == 4096
+        assert "tokens" in config.outputs
+
+    def test_generate_task_rejects_extra_fields(self) -> None:
+        with pytest.raises(ValidationError):
+            GenerateTask(
+                context_length=32768,
+                max_output_tokens=4096,
+                # ``unknown`` is not declared; extra='forbid' rejects it.
+                unknown="x",  # type: ignore
+            )
+
+    def test_generate_capabilities_accepts_ebnf(self) -> None:
+        """``ebnf`` was added to the accepted grammar list when M4 req2's
+        Outlines / XGrammar EBNF support landed. Prior to that this test
+        asserted rejection; it's flipped to acceptance as the regression
+        guard so a future refactor doesn't silently drop EBNF support.
+        """
+        caps = GenerateCapabilities(grammar=["ebnf"])
+        assert "ebnf" in caps.grammar
+
+    def test_generate_capabilities_rejects_unknown_grammar(self) -> None:
+        with pytest.raises(ValidationError):
+            GenerateCapabilities(grammar=["totally-not-a-grammar"])  # type: ignore
+
 
 class TestEngineConfigLoRA:
     """Tests for LoRA configuration in EngineConfig."""
@@ -529,3 +578,150 @@ class TestModelConfigProfiles:
                     "deep": ProfileConfig(extends="mid"),
                 },
             )
+
+
+class TestKvBudgetTokensValidator:
+    """Validator for ``kv_budget_tokens`` on generation profiles."""
+
+    @staticmethod
+    def _make_gen_config(profile: ProfileConfig, *, extra: dict[str, ProfileConfig] | None = None) -> ModelConfig:
+        profiles = {"default": profile}
+        if extra:
+            profiles.update(extra)
+        return ModelConfig(
+            sie_id="Qwen/Qwen3-4B-Instruct-2507",
+            hf_id="Qwen/Qwen3-4B-Instruct-2507",
+            tasks=Tasks(
+                generate=GenerateTask(
+                    context_length=32768,
+                    max_output_tokens=4096,
+                    capabilities=GenerateCapabilities(grammar=[], streaming=True, tools=False),
+                ),
+            ),
+            profiles=profiles,
+        )
+
+    def test_missing_kv_budget_on_gen_profile_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="kv_budget_tokens"):
+            self._make_gen_config(
+                ProfileConfig(
+                    adapter_path="sie_server.adapters.sglang:SGLangGenerationAdapter",
+                    max_batch_tokens=16384,
+                ),
+            )
+
+    def test_zero_kv_budget_on_gen_profile_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="positive int"):
+            self._make_gen_config(
+                ProfileConfig(
+                    adapter_path="sie_server.adapters.sglang:SGLangGenerationAdapter",
+                    max_batch_tokens=16384,
+                    kv_budget_tokens=0,
+                ),
+            )
+
+    def test_negative_kv_budget_on_gen_profile_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="positive int"):
+            self._make_gen_config(
+                ProfileConfig(
+                    adapter_path="sie_server.adapters.sglang:SGLangGenerationAdapter",
+                    max_batch_tokens=16384,
+                    kv_budget_tokens=-512,
+                ),
+            )
+
+    def test_positive_kv_budget_accepted_and_resolved(self) -> None:
+        config = self._make_gen_config(
+            ProfileConfig(
+                adapter_path="sie_server.adapters.sglang:SGLangGenerationAdapter",
+                max_batch_tokens=16384,
+                kv_budget_tokens=8192,
+                admission_enabled=False,
+            ),
+        )
+        resolved = config.resolve_profile("default")
+        assert resolved.kv_budget_tokens == 8192
+        assert resolved.admission_enabled is False
+
+    def test_kv_budget_not_required_on_non_gen_models(self) -> None:
+        """Encode-only / score-only / extract-only models keep working."""
+        config = ModelConfig(
+            sie_id="bge-m3",
+            hf_id="BAAI/bge-m3",
+            tasks=Tasks(encode=EncodeTask(dense=EmbeddingDim(dim=1024))),
+            profiles={
+                "default": ProfileConfig(adapter_path="mod:Cls", max_batch_tokens=8192),
+            },
+        )
+        resolved = config.resolve_profile("default")
+        assert resolved.kv_budget_tokens is None
+
+    def test_child_profile_inherits_kv_budget(self) -> None:
+        """Child profile inherits parent's kv_budget_tokens when not set."""
+        config = self._make_gen_config(
+            ProfileConfig(
+                adapter_path="sie_server.adapters.sglang:SGLangGenerationAdapter",
+                max_batch_tokens=16384,
+                kv_budget_tokens=4096,
+            ),
+            extra={
+                "fast": ProfileConfig(extends="default", max_batch_tokens=8192),
+            },
+        )
+        resolved = config.resolve_profile("fast")
+        assert resolved.kv_budget_tokens == 4096
+
+    def test_child_profile_overrides_kv_budget(self) -> None:
+        config = self._make_gen_config(
+            ProfileConfig(
+                adapter_path="sie_server.adapters.sglang:SGLangGenerationAdapter",
+                max_batch_tokens=16384,
+                kv_budget_tokens=4096,
+            ),
+            extra={
+                "big": ProfileConfig(extends="default", kv_budget_tokens=16384),
+            },
+        )
+        resolved = config.resolve_profile("big")
+        assert resolved.kv_budget_tokens == 16384
+
+    def test_child_missing_when_parent_missing_rejected(self) -> None:
+        """A child that doesn't supply kv_budget_tokens and whose parent
+        also lacks it is rejected (parent is then itself rejected first).
+        """
+        with pytest.raises(ValidationError, match="kv_budget_tokens"):
+            self._make_gen_config(
+                ProfileConfig(
+                    adapter_path="sie_server.adapters.sglang:SGLangGenerationAdapter",
+                    max_batch_tokens=16384,
+                    # No kv_budget_tokens — parent is rejected.
+                ),
+                extra={"fast": ProfileConfig(extends="default", max_batch_tokens=8192)},
+            )
+
+    def test_oversubscribed_budget_emits_warning(self) -> None:
+        """Over-subscribed kv_budget_tokens emits a UserWarning, not an error."""
+        with pytest.warns(UserWarning, match="kv_budget_tokens"):
+            self._make_gen_config(
+                ProfileConfig(
+                    adapter_path="sie_server.adapters.sglang:SGLangGenerationAdapter",
+                    max_batch_tokens=16384,
+                    # Absurdly large to trip the coarse derivation guard.
+                    kv_budget_tokens=10_000_000,
+                    adapter_options=AdapterOptions(loadtime={"mem_fraction_static": 0.85}),
+                ),
+            )
+
+    def test_resolved_profile_carries_admission_fields(self) -> None:
+        config = self._make_gen_config(
+            ProfileConfig(
+                adapter_path="sie_server.adapters.sglang:SGLangGenerationAdapter",
+                max_batch_tokens=16384,
+                kv_budget_tokens=8192,
+                admission_enabled=True,
+            ),
+        )
+        resolved = config.resolve_profile("default")
+        assert isinstance(resolved, ResolvedProfile)
+        assert resolved.kv_budget_tokens == 8192
+        assert resolved.admission_enabled is True

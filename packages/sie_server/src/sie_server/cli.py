@@ -13,6 +13,7 @@ import os
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
 os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
 
+import hashlib
 import logging
 from pathlib import Path
 
@@ -282,7 +283,13 @@ def serve(
             raise typer.Exit(1)
 
     os.environ["SIE_INSTRUMENTATION"] = "true" if instrumentation else "false"
-    os.environ["SIE_BUNDLE"] = bundle or "default"
+    if bundle:
+        os.environ["SIE_BUNDLE"] = bundle
+    elif model_filter:
+        digest = hashlib.sha256(",".join(sorted(model_filter)).encode("utf-8")).hexdigest()[:12]
+        os.environ["SIE_BUNDLE"] = f"adhoc-{digest}"
+    else:
+        os.environ["SIE_BUNDLE"] = "default"
     # Pass cache config via environment variables
     if local_cache:
         os.environ["SIE_LOCAL_CACHE"] = str(Path(local_cache).resolve())

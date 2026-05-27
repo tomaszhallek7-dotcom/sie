@@ -296,6 +296,161 @@ class ExtractResult(TypedDict, total=False):
     data: dict[str, Any]
 
 
+# Streaming generation result. Streaming happens inside the gateway/worker;
+# the SDK surfaces the aggregated outcome plus SIE-native timing metadata
+# (TTFT, TPOT, attempt_id). Future SDK additions may surface chunks as an
+# async iterator — see the POC plan §4.5.4.
+FinishReason = Literal["stop", "length", "cancelled", "content_filter", "error"]
+
+
+class GenerationUsage(TypedDict):
+    """Token usage for a single generation call."""
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class GenerateResult(TypedDict, total=False):
+    """Aggregated generation result returned by :meth:`SIEClient.generate`.
+
+    Attributes:
+        model: Model id the gateway dispatched to.
+        text: Full generated text (concatenation of all streamed deltas).
+        finish_reason: ``stop`` | ``length`` | ``cancelled`` | ``error``.
+        usage: Prompt / completion / total token counts.
+        attempt_id: Worker-generated id for this attempt; useful to
+            correlate gateway logs with worker logs across redelivery.
+        ttft_ms: Time-to-first-token in milliseconds (worker-measured).
+        tpot_ms: Average time per output token in milliseconds.
+    """
+
+    model: str
+    text: str
+    finish_reason: FinishReason
+    usage: GenerationUsage
+    attempt_id: str | None
+    ttft_ms: float | None
+    tpot_ms: float | None
+
+
+class GenerateChunk(TypedDict, total=False):
+    """One SSE event from :meth:`SIEClient.stream_generate` (SIE-native shape).
+
+    Mirrors ``build_generate_chunk_event`` in
+    ``packages/sie_gateway/src/handlers/sse.rs``. ``usage`` / ``ttft_ms`` land
+    only on the terminal chunk (``done`` is ``True``); ``error`` is populated
+    when the worker/gateway failed mid-stream — the SDK raises
+    :class:`~sie_sdk.client.errors.ServerError` rather than yielding it.
+
+    Attributes:
+        request_id: Gateway request id (stable across the stream).
+        seq: Monotonic per-attempt chunk sequence number.
+        text_delta: Incremental text for this chunk.
+        done: ``True`` on the terminal chunk.
+        finish_reason: Termination reason (terminal chunk only).
+        usage: Prompt / completion / total token counts (terminal chunk only).
+        ttft_ms: Time-to-first-token in milliseconds (terminal chunk only).
+        error: ``{code, message}`` when generation failed mid-stream.
+    """
+
+    request_id: str
+    seq: int
+    text_delta: str
+    done: bool
+    finish_reason: FinishReason
+    usage: GenerationUsage
+    ttft_ms: float
+    error: dict[str, str]
+
+
+# --- Chat completions (OpenAI-compatible) — /v1/chat/completions ------------
+
+ChatRole = Literal["system", "user", "assistant", "tool", "developer"]
+
+# OpenAI chat finish reason (``null`` on non-terminal streaming chunks).
+ChatFinishReason = Literal["stop", "length", "tool_calls", "content_filter"] | None
+
+
+class ChatMessage(TypedDict, total=False):
+    """A single chat message.
+
+    The gateway accepts ``system | user | assistant | tool`` with string
+    ``content``; ``tool_calls`` / ``tool_call_id`` are honoured on the
+    multi-turn tool-replay path. See the gateway schema for the canonical
+    accepted subset.
+    """
+
+    role: ChatRole
+    content: str | None
+    name: str
+    tool_call_id: str
+    tool_calls: list[dict[str, Any]]
+
+
+class ChatUsage(TypedDict):
+    """Token usage block (wire shape)."""
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class ChatChoice(TypedDict, total=False):
+    """A single choice in a non-streaming :class:`ChatCompletion`."""
+
+    index: int
+    message: ChatMessage
+    finish_reason: ChatFinishReason
+    logprobs: Any
+
+
+class ChatCompletion(TypedDict, total=False):
+    """Non-streaming response from :meth:`SIEClient.chat_completions`."""
+
+    id: str
+    object: str
+    created: int
+    model: str
+    system_fingerprint: str | None
+    choices: list[ChatChoice]
+    usage: ChatUsage
+
+
+class ChatDelta(TypedDict, total=False):
+    """Incremental delta emitted on each streaming chunk."""
+
+    role: str
+    content: str
+    tool_calls: list[dict[str, Any]]
+
+
+class ChatChunkChoice(TypedDict, total=False):
+    """A single choice in a streaming :class:`ChatCompletionChunk`."""
+
+    index: int
+    delta: ChatDelta
+    finish_reason: ChatFinishReason
+    logprobs: Any
+
+
+class ChatCompletionChunk(TypedDict, total=False):
+    """One SSE event from :meth:`SIEClient.stream_chat_completions`.
+
+    The terminal usage-only chunk (emitted when
+    ``stream_options.include_usage`` is ``True``) sets ``choices: []`` and
+    populates ``usage``.
+    """
+
+    id: str
+    object: str
+    created: int
+    model: str
+    system_fingerprint: str | None
+    choices: list[ChatChunkChoice]
+    usage: ChatUsage
+
+
 class WorkerInfo(TypedDict, total=False):
     """Information about a single worker in the cluster.
 
@@ -338,7 +493,7 @@ class CapacityInfo(TypedDict, total=False):
         worker_count: Number of healthy workers.
         gpu_count: Number of GPUs available.
         models_loaded: Number of unique models loaded across all workers.
-        configured_gpu_types: GPU types configured in the cluster (from Helm).
+        configured_gpu_types: Canonical machine profiles configured in the cluster.
         live_gpu_types: GPU types currently running (subset of configured).
         workers: List of worker details.
     """
@@ -356,11 +511,13 @@ class PoolSpec(TypedDict, total=False):
     """Resource pool specification for creating pools.
 
     Used to reserve capacity in a cluster for exclusive use.
-    Pools are created lazily on first request and garbage collected after inactivity.
+    Re-posting the same pool name updates the readiness requirements/caps and
+    renews the lease.
 
     Attributes:
-        name: Pool name (required). Used in GPU param as "pool_name/gpu_type".
-        gpus: GPU requirements, e.g., {"l4": 2, "a100-40gb": 1}.
+        name: Pool name (required). Used in GPU param as "pool_name/machine_profile".
+        gpus: Optional GPU requirements for pool readiness, e.g., {"l4": 2, "a100-40gb": 1}.
+        gpu_caps: Optional maximum assigned workers per GPU type.
         bundle: Optional bundle filter for worker assignment.
         minimum_worker_count: Desired minimum warm workers in the pool. Stored in pool
             spec and forwarded to the gateway; enforcement depends on cluster autoscaler
@@ -369,6 +526,7 @@ class PoolSpec(TypedDict, total=False):
 
     name: str
     gpus: dict[str, int]
+    gpu_caps: dict[str, int]
     bundle: str
     minimum_worker_count: int
 
@@ -410,12 +568,14 @@ class PoolSpecResponse(TypedDict, total=False):
     """Pool specification in API response.
 
     Attributes:
-        gpus: GPU requirements, e.g., {"l4": 2, "a100-40gb": 1}.
+        gpus: GPU requirements for pool readiness, e.g., {"l4": 2, "a100-40gb": 1}.
+        gpu_caps: Optional maximum assigned workers per GPU type.
         bundle: Optional bundle filter for worker assignment.
         minimum_worker_count: Minimum warm workers in the pool.
     """
 
     gpus: dict[str, int]
+    gpu_caps: dict[str, int]
     bundle: str | None
     minimum_worker_count: int
 
@@ -513,7 +673,7 @@ class HealthResponse(TypedDict, total=False):
         status: Overall status ("healthy", "degraded", "no_workers").
         type: Component type ("gateway" or "worker").
         cluster: Cluster summary statistics.
-        configured_gpu_types: GPU types configured in the cluster.
+        configured_gpu_types: Canonical machine profiles configured in the cluster.
         live_gpu_types: GPU types currently running.
         workers: List of worker details.
         models: List of model summaries.
@@ -671,6 +831,11 @@ class WorkerStatusMessage(TypedDict, total=False):
             single inference call (minimum across loaded models).
         counters: Prometheus counter values for QPS calculation.
         histograms: Prometheus histogram data for latency percentiles.
+        saturated: Admission backpressure signal for direct-dispatch routing. True when the worker is
+            at or above its high-water mark and the gateway should temporarily
+            exclude it from the HRW direct-dispatch ring. The worker owns
+            hysteresis (90/70 thresholds); the gateway just consumes the bool.
+            Defaults to False; missing field on legacy workers means "not saturated".
     """
 
     timestamp: float
@@ -688,6 +853,7 @@ class WorkerStatusMessage(TypedDict, total=False):
     max_batch_requests: int
     counters: dict[str, dict[str, float]]
     histograms: dict[str, dict[str, dict[str, Any]]]
+    saturated: bool
 
 
 class ClusterStatusMessage(TypedDict, total=False):

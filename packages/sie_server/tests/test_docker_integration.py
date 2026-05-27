@@ -35,6 +35,11 @@ class TestDockerImageBasics:
         response = httpx.get(f"{sie_docker_server}/healthz", timeout=10.0)
         assert response.status_code == 200
 
+        # GPU-aware liveness probe (issue #1025) is wired and healthy. On a CPU
+        # container there is no GPU to wedge, so it reports 200.
+        response = httpx.get(f"{sie_docker_server}/livez", timeout=10.0)
+        assert response.status_code == 200
+
     def test_models_endpoint(self, docker_client: SIEClient) -> None:
         """Docker container can list available models."""
         models = docker_client.list_models()

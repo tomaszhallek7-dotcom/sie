@@ -7,7 +7,9 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use crate::types::bundle::BundleInfo;
-use crate::types::model::{CanonicalProfile, ModelConfig, ModelEntry, ModelInfoExtras};
+use crate::types::model::{
+    CanonicalProfile, ModelConfig, ModelEntry, ModelInfoExtras, ProfileConfig,
+};
 
 #[derive(Debug)]
 pub struct ModelNotFoundError {
@@ -182,17 +184,19 @@ impl ModelRegistry {
                             continue;
                         }
                         match Self::load_model_file(&path) {
-                            Ok(model_entry) => {
-                                debug!(
-                                    model = %model_entry.name,
-                                    adapters = ?model_entry.adapter_modules,
-                                    "discovered model"
-                                );
-                                new_model_names_lower.insert(
-                                    model_entry.name.to_lowercase(),
-                                    model_entry.name.clone(),
-                                );
-                                new_models.insert(model_entry.name.clone(), model_entry);
+                            Ok(model_entries) => {
+                                for model_entry in model_entries {
+                                    debug!(
+                                        model = %model_entry.name,
+                                        adapters = ?model_entry.adapter_modules,
+                                        "discovered model"
+                                    );
+                                    new_model_names_lower.insert(
+                                        model_entry.name.to_lowercase(),
+                                        model_entry.name.clone(),
+                                    );
+                                    new_models.insert(model_entry.name.clone(), model_entry);
+                                }
                             }
                             Err(e) => {
                                 error!(path = %path.display(), error = %e, "failed to load model config");
@@ -210,28 +214,7 @@ impl ModelRegistry {
 
         // Compute model-to-bundle mappings
         for model_entry in new_models.values_mut() {
-            if model_entry.adapter_modules.is_empty() {
-                continue;
-            }
-            let mut matching: Vec<(i32, String)> = Vec::new();
-            for bundle in new_bundles.values() {
-                let bundle_adapters: HashSet<&str> =
-                    bundle.adapters.iter().map(|s| s.as_str()).collect();
-                let has_overlap = model_entry
-                    .adapter_modules
-                    .iter()
-                    .any(|a| bundle_adapters.contains(a.as_str()));
-                if has_overlap {
-                    matching.push((bundle.priority, bundle.name.clone()));
-                }
-            }
-            // Break priority ties by bundle name so `model_entry.bundles[0]`
-            // (the default-selected bundle at route time) is stable across
-            // runs — `new_bundles` / bundle iteration comes from a
-            // `HashMap`, so without a secondary key equal-priority bundles
-            // would shuffle between replicas and between process restarts.
-            matching.sort_by(|(pa, na), (pb, nb)| pa.cmp(pb).then_with(|| na.cmp(nb)));
-            model_entry.bundles = matching.into_iter().map(|(_, name)| name).collect();
+            Self::assign_bundles(model_entry, &new_bundles);
         }
 
         // Pre-compute bundle config hashes (expensive: sort + JSON + SHA-256).
@@ -293,27 +276,135 @@ impl ModelRegistry {
         })
     }
 
-    fn load_model_file(path: &Path) -> Result<ModelEntry, Box<dyn std::error::Error>> {
+    fn load_model_file(path: &Path) -> Result<Vec<ModelEntry>, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
         let config: ModelConfig = serde_yaml::from_str(&content)?;
 
-        let info_extras = crate::types::model::ModelInfoExtras::from_model_config(&config);
-        let model_name = config.name;
+        Self::expand_model_config_into_profile_variants(&config).map_err(|message| {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message,
+            )) as Box<dyn std::error::Error>
+        })
+    }
+
+    /// Profile names show up in the registry as `format!("{base}:{profile}")`.
+    /// A name containing `/`, `:`, whitespace, or non-printable bytes would
+    /// either shadow a legitimate base model id or produce an unparseable
+    /// model spec when concatenated. Reject at load so misconfigured YAML
+    /// fails fast instead of producing a phantom registry entry that
+    /// routing then silently bypasses.
+    fn validate_profile_name(name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("profile name must not be empty".to_string());
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err(format!(
+                "profile name '{name}' must match [A-Za-z0-9._-]+ \
+                 (no '/', ':', whitespace, or other punctuation)"
+            ));
+        }
+        Ok(())
+    }
+
+    fn expand_model_config_into_profile_variants(
+        config: &ModelConfig,
+    ) -> Result<Vec<ModelEntry>, String> {
+        let base_entry = Self::model_entry_from_config(config)?;
+        let mut entries = vec![base_entry.clone()];
+        let mut profile_names: Vec<String> = base_entry.profile_names.iter().cloned().collect();
+        profile_names.sort();
+        for profile_name in profile_names {
+            if profile_name == "default" {
+                continue;
+            }
+            Self::validate_profile_name(&profile_name)?;
+            let profile_config =
+                Self::resolved_profile_from_profiles(&config.profiles, &profile_name)?;
+            let mut variant_profile_names = HashSet::new();
+            variant_profile_names.insert("default".to_string());
+            let mut variant_profile_configs = HashMap::new();
+            variant_profile_configs.insert("default".to_string(), profile_config);
+            let mut variant_adapters = HashSet::new();
+            if let Some(adapter_path) =
+                Self::effective_adapter_path_from_profiles(&config.profiles, &profile_name)
+            {
+                if let Some(module) = Self::adapter_module_from_path(adapter_path) {
+                    variant_adapters.insert(module);
+                }
+            }
+            entries.push(ModelEntry {
+                name: format!("{}:{}", base_entry.name, profile_name),
+                bundles: Vec::new(),
+                adapter_modules: variant_adapters,
+                profile_names: variant_profile_names,
+                profile_configs: variant_profile_configs,
+                info_extras: Self::narrow_info_extras_to_profile(
+                    &base_entry.info_extras,
+                    &profile_name,
+                ),
+            });
+        }
+
+        Ok(entries)
+    }
+
+    /// Re-scope an ``info_extras`` (built for the base entry, which holds
+    /// the union of capabilities across profiles) so a variant entry
+    /// ``{base}:{profile_name}`` only advertises and validates against the
+    /// adapters configured for *its* profile. Without this narrowing,
+    /// the variant inherits the union and the lora_adapter gate accepts
+    /// adapters that are only configured on a sibling profile (M10 bug).
+    /// All other capability fields stay the same.
+    fn narrow_info_extras_to_profile(
+        base: &ModelInfoExtras,
+        profile_name: &str,
+    ) -> ModelInfoExtras {
+        let mut narrowed = base.clone();
+        if let Some(map) = base.profile_lora_adapters.as_ref() {
+            let scoped = map.get(profile_name).cloned().unwrap_or_default();
+            if scoped.is_empty() {
+                // Profile has no adapters declared — drop both fields so
+                // the gate rejects any ``lora_adapter`` value as unknown.
+                narrowed.lora_adapters = None;
+                narrowed.profile_lora_adapters = None;
+            } else {
+                narrowed.lora_adapters = Some(scoped.clone());
+                let mut single = HashMap::new();
+                // Variants are keyed under ``"default"`` in their
+                // ``profile_configs`` (the resolved profile becomes the
+                // variant's default); mirror that here so the validation
+                // gate's profile lookup (``"default"`` for variants)
+                // matches the narrowed map.
+                single.insert("default".to_string(), scoped);
+                narrowed.profile_lora_adapters = Some(single);
+            }
+        }
+        narrowed
+    }
+
+    fn model_entry_from_config(config: &ModelConfig) -> Result<ModelEntry, String> {
+        let info_extras = crate::types::model::ModelInfoExtras::from_model_config(config);
+        let model_name = config.name.clone();
         let mut adapter_modules: HashSet<String> = HashSet::new();
         let mut profile_names: HashSet<String> = HashSet::new();
         let mut profile_configs: HashMap<String, CanonicalProfile> = HashMap::new();
 
-        for (profile_name, profile) in &config.profiles {
+        for profile_name in config.profiles.keys() {
             profile_names.insert(profile_name.clone());
-            if let Some(adapter_path) = &profile.adapter_path {
-                if !adapter_path.is_empty() {
-                    let module = adapter_path.split(':').next().unwrap_or(adapter_path);
-                    adapter_modules.insert(module.to_string());
+            if let Some(adapter_path) =
+                Self::effective_adapter_path_from_profiles(&config.profiles, profile_name)
+            {
+                if let Some(module) = Self::adapter_module_from_path(adapter_path) {
+                    adapter_modules.insert(module);
                 }
             }
             profile_configs.insert(
                 profile_name.clone(),
-                CanonicalProfile::from_profile(profile),
+                Self::resolved_profile_from_profiles(&config.profiles, profile_name)?,
             );
         }
 
@@ -325,6 +416,264 @@ impl ModelRegistry {
             profile_configs,
             info_extras,
         })
+    }
+
+    fn expand_model_entry_into_profile_variants(
+        base_entry: &ModelEntry,
+    ) -> Result<Vec<ModelEntry>, String> {
+        let mut entries = vec![base_entry.clone()];
+        let mut profile_names: Vec<String> = base_entry.profile_names.iter().cloned().collect();
+        profile_names.sort();
+        for profile_name in profile_names {
+            if profile_name == "default" {
+                continue;
+            }
+            // Enforce the same profile-name allowlist as the file-load
+            // expansion path (`expand_model_config_into_profile_variants`).
+            // This is the LIVE delta path
+            // (`add_model_config_inner` → here): without this check a
+            // control-plane delta carrying a profile named e.g.
+            // `bad/name` or `a:b` would mint a phantom registry entry
+            // (`{base}:{bad/name}`) that produces an illegal model spec /
+            // shadows a base id, which routing then silently bypasses.
+            Self::validate_profile_name(&profile_name)?;
+            let Some(profile_config) = Self::resolved_profile_from_entry(base_entry, &profile_name)
+            else {
+                return Err(Self::profile_resolution_error(&profile_name));
+            };
+            let mut variant_profile_names = HashSet::new();
+            variant_profile_names.insert("default".to_string());
+            let mut variant_profile_configs = HashMap::new();
+            variant_profile_configs.insert("default".to_string(), profile_config);
+            let mut variant_adapters = HashSet::new();
+            if let Some(adapter_path) =
+                Self::effective_adapter_path_from_entry(base_entry, &profile_name)
+            {
+                if let Some(module) = Self::adapter_module_from_path(adapter_path) {
+                    variant_adapters.insert(module);
+                }
+            }
+            entries.push(ModelEntry {
+                name: format!("{}:{}", base_entry.name, profile_name),
+                bundles: Vec::new(),
+                adapter_modules: variant_adapters,
+                profile_names: variant_profile_names,
+                profile_configs: variant_profile_configs,
+                info_extras: Self::narrow_info_extras_to_profile(
+                    &base_entry.info_extras,
+                    &profile_name,
+                ),
+            });
+        }
+
+        Ok(entries)
+    }
+
+    fn adapter_module_from_path(adapter_path: &str) -> Option<String> {
+        if adapter_path.is_empty() {
+            None
+        } else {
+            Some(
+                adapter_path
+                    .split(':')
+                    .next()
+                    .unwrap_or(adapter_path)
+                    .to_string(),
+            )
+        }
+    }
+
+    fn empty_profile_config() -> crate::types::model::ProfileConfig {
+        crate::types::model::ProfileConfig {
+            adapter_path: None,
+            max_batch_tokens: None,
+            compute_precision: None,
+            adapter_options: None,
+            extends: None,
+        }
+    }
+
+    fn resolved_profile_from_profiles(
+        profiles: &HashMap<String, crate::types::model::ProfileConfig>,
+        profile_name: &str,
+    ) -> Result<CanonicalProfile, String> {
+        fn resolve(
+            profiles: &HashMap<String, crate::types::model::ProfileConfig>,
+            profile_name: &str,
+            seen: &mut HashSet<String>,
+        ) -> Option<crate::types::model::ProfileConfig> {
+            if !seen.insert(profile_name.to_string()) {
+                return None;
+            }
+            let profile = profiles.get(profile_name)?;
+            let mut resolved = if let Some(parent_name) = profile.extends.as_deref() {
+                resolve(profiles, parent_name, seen)?
+            } else {
+                ModelRegistry::empty_profile_config()
+            };
+
+            if profile.adapter_path.is_some() {
+                resolved.adapter_path = profile.adapter_path.clone();
+            }
+            if profile.max_batch_tokens.is_some() {
+                resolved.max_batch_tokens = profile.max_batch_tokens;
+            }
+            if profile.compute_precision.is_some() {
+                resolved.compute_precision = profile.compute_precision.clone();
+            }
+            if profile.adapter_options.is_some() {
+                resolved.adapter_options = profile.adapter_options.clone();
+            }
+            resolved.extends = None;
+            Some(resolved)
+        }
+
+        resolve(profiles, profile_name, &mut HashSet::new())
+            .map(|profile| CanonicalProfile::from_profile(&profile))
+            .ok_or_else(|| Self::profile_resolution_error(profile_name))
+    }
+
+    fn profile_resolution_error(profile_name: &str) -> String {
+        format!("Profile '{profile_name}' has a missing parent or an inheritance cycle")
+    }
+
+    /// Build a ``ProfileConfig`` map that overlays incoming profiles on top
+    /// of the canonical profiles already stored for an existing model.
+    /// Used by the update path so a delta config whose new profile
+    /// ``extends`` a profile that lives only in
+    /// ``existing.profile_configs`` still resolves cleanly. Incoming
+    /// profiles win on collisions because the caller's whole point is to
+    /// re-evaluate them — the stored CanonicalProfile would be stale.
+    fn merge_profiles_for_resolution(
+        existing: &HashMap<String, CanonicalProfile>,
+        incoming: &HashMap<String, crate::types::model::ProfileConfig>,
+    ) -> HashMap<String, crate::types::model::ProfileConfig> {
+        let mut merged: HashMap<String, crate::types::model::ProfileConfig> = existing
+            .iter()
+            .map(|(name, canon)| {
+                (
+                    name.clone(),
+                    crate::types::model::ProfileConfig {
+                        adapter_path: canon.adapter_path.clone(),
+                        max_batch_tokens: canon.max_batch_tokens,
+                        compute_precision: canon.compute_precision.clone(),
+                        adapter_options: canon.adapter_options.clone(),
+                        // The stored profile is already inheritance-resolved,
+                        // so flatten it: no further extends lookups needed.
+                        extends: None,
+                    },
+                )
+            })
+            .collect();
+        for (name, profile) in incoming {
+            merged.insert(name.clone(), profile.clone());
+        }
+        merged
+    }
+
+    fn resolved_profile_from_entry(
+        entry: &ModelEntry,
+        profile_name: &str,
+    ) -> Option<CanonicalProfile> {
+        if profile_name == "default" {
+            return entry.profile_configs.get("default").cloned();
+        }
+
+        let mut resolved =
+            entry
+                .profile_configs
+                .get("default")
+                .cloned()
+                .unwrap_or(CanonicalProfile {
+                    adapter_path: None,
+                    max_batch_tokens: None,
+                    compute_precision: None,
+                    adapter_options: None,
+                });
+        let profile = entry.profile_configs.get(profile_name)?;
+
+        if profile.adapter_path.is_some() {
+            resolved.adapter_path = profile.adapter_path.clone();
+        }
+        if profile.max_batch_tokens.is_some() {
+            resolved.max_batch_tokens = profile.max_batch_tokens;
+        }
+        if profile.compute_precision.is_some() {
+            resolved.compute_precision = profile.compute_precision.clone();
+        }
+        if profile.adapter_options.is_some() {
+            resolved.adapter_options = profile.adapter_options.clone();
+        }
+        Some(resolved)
+    }
+
+    fn adapter_modules_from_entry_profiles(entry: &ModelEntry) -> HashSet<String> {
+        entry
+            .profile_names
+            .iter()
+            .filter_map(|profile_name| Self::effective_adapter_path_from_entry(entry, profile_name))
+            .filter_map(Self::adapter_module_from_path)
+            .collect()
+    }
+
+    fn effective_adapter_path_from_profiles<'a>(
+        profiles: &'a HashMap<String, crate::types::model::ProfileConfig>,
+        profile_name: &str,
+    ) -> Option<&'a str> {
+        let mut current = Some(profile_name);
+        let mut seen = HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name.to_string()) {
+                return None;
+            }
+            let profile = profiles.get(name)?;
+            if let Some(adapter_path) = profile.adapter_path.as_deref().filter(|s| !s.is_empty()) {
+                return Some(adapter_path);
+            }
+            current = profile.extends.as_deref();
+        }
+        None
+    }
+
+    fn effective_adapter_path_from_entry<'a>(
+        entry: &'a ModelEntry,
+        profile_name: &str,
+    ) -> Option<&'a str> {
+        entry
+            .profile_configs
+            .get(profile_name)
+            .and_then(|profile| profile.adapter_path.as_deref())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                entry
+                    .profile_configs
+                    .get("default")
+                    .and_then(|profile| profile.adapter_path.as_deref())
+                    .filter(|s| !s.is_empty())
+            })
+    }
+
+    fn assign_bundles(entry: &mut ModelEntry, bundles: &HashMap<String, BundleInfo>) {
+        if entry.adapter_modules.is_empty() {
+            entry.bundles.clear();
+            return;
+        }
+        let mut matching: Vec<(i32, String)> = Vec::new();
+        for bundle in bundles.values() {
+            let bundle_adapters: HashSet<&str> =
+                bundle.adapters.iter().map(|s| s.as_str()).collect();
+            let has_overlap = entry
+                .adapter_modules
+                .iter()
+                .any(|a| bundle_adapters.contains(a.as_str()));
+            if has_overlap {
+                matching.push((bundle.priority, bundle.name.clone()));
+            }
+        }
+        // Break priority ties by bundle name so the default-selected bundle is
+        // stable across HashMap iteration order and process restarts.
+        matching.sort_by(|(pa, na), (pb, nb)| pa.cmp(pb).then_with(|| na.cmp(nb)));
+        entry.bundles = matching.into_iter().map(|(_, name)| name).collect();
     }
 
     pub fn resolve_bundle(
@@ -373,6 +722,22 @@ impl ModelRegistry {
         let snap = self.snapshot.load();
         snap.model_names_lower.contains_key(&model.to_lowercase())
             || snap.models.contains_key(model)
+    }
+
+    /// Resolve a caller-supplied model id to the registry's canonical
+    /// stored name, case-insensitively. `model_exists` is already
+    /// case-insensitive (it consults `model_names_lower`), so without
+    /// canonicalisation `Org/Model`, `org/model`, and `ORG/MODEL` all
+    /// pass `model_exists` yet flow downstream as three distinct
+    /// strings — and therefore three distinct Prometheus label series
+    /// and three distinct dispatch keys. Folding to the canonical name
+    /// at the request boundary collapses them to one series / one key.
+    ///
+    /// Returns `None` when the id is unknown to the registry, so callers
+    /// can keep the as-given string for the 404 path.
+    pub fn resolve_canonical_model_name(&self, model: &str) -> Option<String> {
+        let snap = self.snapshot.load();
+        Self::canonical_model_name(&snap, model)
     }
 
     /// Fast check for "is the registry populated at all?". Used by the
@@ -650,16 +1015,28 @@ impl ModelRegistry {
             return Err("Missing required field: name/sie_id".to_string());
         }
 
+        // Reject model IDs containing control characters (newlines, carriage
+        // returns, NULs, etc.). These can break SSE ``data:`` framing and
+        // log structured output if propagated downstream; gating at
+        // registration time keeps every downstream consumer simple.
+        if sie_id.chars().any(|c| c.is_control()) {
+            return Err(format!(
+                "Invalid model id: contains control character (sie_id={:?})",
+                sie_id
+            ));
+        }
+
         if config.profiles.is_empty() {
             return Err("Missing required field: profiles".to_string());
         }
 
         let mut new_adapter_modules: HashSet<String> = HashSet::new();
         for (profile_name, profile) in &config.profiles {
-            if let Some(ref adapter_path) = profile.adapter_path {
-                if !adapter_path.is_empty() {
-                    let module = adapter_path.split(':').next().unwrap_or(adapter_path);
-                    new_adapter_modules.insert(module.to_string());
+            if let Some(adapter_path) =
+                Self::effective_adapter_path_from_profiles(&config.profiles, profile_name)
+            {
+                if let Some(module) = Self::adapter_module_from_path(adapter_path) {
+                    new_adapter_modules.insert(module);
                 }
             } else if profile.extends.is_none() {
                 return Err(format!("Profile '{}' missing adapter_path", profile_name));
@@ -698,9 +1075,20 @@ impl ModelRegistry {
             // reject conflicts. When `authoritative` is true (bootstrap /
             // epoch-poll catch-up), a conflicting profile is OVERWRITTEN
             // with a warn so the control plane's latest word wins.
-            for (profile_name, profile) in &config.profiles {
+            //
+            // Resolution map: a delta update can carry a profile that
+            // ``extends`` a profile only present in ``existing.profile_configs``
+            // (e.g. an incoming ``a100-40gb`` extending an already-stored
+            // ``default``). Build a temporary ``ProfileConfig`` map combining
+            // already-stored canonical profiles with the incoming ones —
+            // incoming wins on collisions — and resolve against that.
+            let merged_profiles =
+                Self::merge_profiles_for_resolution(&existing.profile_configs, &config.profiles);
+
+            for profile_name in config.profiles.keys() {
                 if existing.profile_names.contains(profile_name) {
-                    let incoming = CanonicalProfile::from_profile(profile);
+                    let incoming =
+                        Self::resolved_profile_from_profiles(&merged_profiles, profile_name)?;
                     if let Some(stored) = existing.profile_configs.get(profile_name) {
                         if stored != &incoming {
                             if !authoritative {
@@ -722,53 +1110,42 @@ impl ModelRegistry {
                                  likely a control-plane schema change between bootstrap and catch-up",
                             );
                             overridden_profiles.push(profile_name.clone());
-                            if let Some(ref adapter_path) = profile.adapter_path {
-                                if !adapter_path.is_empty() {
-                                    let module =
-                                        adapter_path.split(':').next().unwrap_or(adapter_path);
-                                    existing.adapter_modules.insert(module.to_string());
-                                }
-                            }
                             continue;
                         }
                     }
                     skipped_profiles.push(profile_name.clone());
                 } else {
                     created_profiles.push(profile_name.clone());
-                    if let Some(ref adapter_path) = profile.adapter_path {
-                        if !adapter_path.is_empty() {
-                            let module = adapter_path.split(':').next().unwrap_or(adapter_path);
-                            existing.adapter_modules.insert(module.to_string());
-                        }
-                    }
                 }
             }
 
             for pname in &created_profiles {
                 existing.profile_names.insert(pname.clone());
-                if let Some(profile) = config.profiles.get(pname) {
-                    existing
-                        .profile_configs
-                        .insert(pname.clone(), CanonicalProfile::from_profile(profile));
-                }
+                existing.profile_configs.insert(
+                    pname.clone(),
+                    Self::resolved_profile_from_profiles(&merged_profiles, pname)?,
+                );
             }
             // Authoritative overrides: replace the stored CanonicalProfile.
             for pname in &overridden_profiles {
-                if let Some(profile) = config.profiles.get(pname) {
-                    existing
-                        .profile_configs
-                        .insert(pname.clone(), CanonicalProfile::from_profile(profile));
-                }
+                existing.profile_configs.insert(
+                    pname.clone(),
+                    Self::resolved_profile_from_profiles(&merged_profiles, pname)?,
+                );
             }
-            Self::merge_model_info_extras(&mut existing.info_extras, &config);
+            existing.adapter_modules = Self::adapter_modules_from_entry_profiles(existing);
+            Self::merge_model_info_extras(&mut existing.info_extras, &config, &merged_profiles);
         } else {
             // New model
             let mut profile_names: HashSet<String> = HashSet::new();
             let mut profile_configs: HashMap<String, CanonicalProfile> = HashMap::new();
 
-            for (pname, profile) in &config.profiles {
+            for pname in config.profiles.keys() {
                 profile_names.insert(pname.clone());
-                profile_configs.insert(pname.clone(), CanonicalProfile::from_profile(profile));
+                profile_configs.insert(
+                    pname.clone(),
+                    Self::resolved_profile_from_profiles(&config.profiles, pname)?,
+                );
             }
 
             created_profiles = config.profiles.keys().cloned().collect();
@@ -789,34 +1166,43 @@ impl ModelRegistry {
                 .insert(sie_id.to_lowercase(), sie_id.clone());
         }
 
-        // Recompute bundle mappings for this model
-        if let Some(model_entry) = snap.models.get_mut(sie_id) {
-            let mut matching: Vec<(i32, String)> = Vec::new();
-            for bundle in snap.bundles.values() {
-                let bundle_adapters: HashSet<&str> =
-                    bundle.adapters.iter().map(|s| s.as_str()).collect();
-                let has_overlap = model_entry
-                    .adapter_modules
-                    .iter()
-                    .any(|a| bundle_adapters.contains(a.as_str()));
-                if has_overlap {
-                    matching.push((bundle.priority, bundle.name.clone()));
-                }
+        let variant_prefix = format!("{sie_id}:");
+        let mut affected_bundles: Vec<String> = snap
+            .models
+            .iter()
+            .filter(|(name, _)| *name == sie_id || name.starts_with(&variant_prefix))
+            .flat_map(|(_, entry)| entry.bundles.clone())
+            .collect();
+        let mut affected_model_names = vec![sie_id.clone()];
+        if let Some(base_entry) = snap.models.get(sie_id).cloned() {
+            let old_variants: Vec<String> = snap
+                .models
+                .keys()
+                .filter(|name| name.starts_with(&variant_prefix))
+                .cloned()
+                .collect();
+            for name in old_variants {
+                snap.models.remove(&name);
+                snap.model_names_lower.remove(&name.to_lowercase());
             }
-            // Break priority ties by bundle name so `model_entry.bundles[0]`
-            // (the default-selected bundle at route time) is stable across
-            // runs — `new_bundles` / bundle iteration comes from a
-            // `HashMap`, so without a secondary key equal-priority bundles
-            // would shuffle between replicas and between process restarts.
-            matching.sort_by(|(pa, na), (pb, nb)| pa.cmp(pb).then_with(|| na.cmp(nb)));
-            model_entry.bundles = matching.iter().map(|(_, name)| name.clone()).collect();
+
+            for mut entry in Self::expand_model_entry_into_profile_variants(&base_entry)? {
+                Self::assign_bundles(&mut entry, &snap.bundles);
+                affected_model_names.push(entry.name.clone());
+                snap.model_names_lower
+                    .insert(entry.name.to_lowercase(), entry.name.clone());
+                snap.models.insert(entry.name.clone(), entry);
+            }
         }
 
-        let affected_bundles = snap
-            .models
-            .get(sie_id)
-            .map(|e| e.bundles.clone())
-            .unwrap_or_default();
+        affected_bundles.extend(
+            affected_model_names
+                .iter()
+                .filter_map(|name| snap.models.get(name))
+                .flat_map(|e| e.bundles.clone()),
+        );
+        affected_bundles.sort();
+        affected_bundles.dedup();
 
         // Recompute config hashes for affected bundles
         for bundle_name in &affected_bundles {
@@ -842,8 +1228,16 @@ impl ModelRegistry {
         Ok((created_profiles, skipped_profiles, affected_bundles))
     }
 
-    fn merge_model_info_extras(existing: &mut ModelInfoExtras, config: &ModelConfig) {
-        if config.inputs.is_none() && config.tasks.is_none() && config.max_sequence_length.is_none()
+    fn merge_model_info_extras(
+        existing: &mut ModelInfoExtras,
+        config: &ModelConfig,
+        merged_profiles: &HashMap<String, ProfileConfig>,
+    ) {
+        let touches_profiles = !config.profiles.is_empty();
+        if config.inputs.is_none()
+            && config.tasks.is_none()
+            && config.max_sequence_length.is_none()
+            && !touches_profiles
         {
             return;
         }
@@ -855,9 +1249,31 @@ impl ModelRegistry {
         if config.tasks.is_some() {
             existing.outputs = refreshed.outputs;
             existing.dims = refreshed.dims;
+            existing.max_output_tokens = refreshed.max_output_tokens;
+            // M10 follow-up: grammar+tools capabilities are derived
+            // from ``tasks.generate.capabilities`` on the model-level
+            // config — refresh here so a delta-update can rescind or
+            // tighten the advertised set without a full reload.
+            existing.grammar_capabilities = refreshed.grammar_capabilities;
+            existing.tools_supported = refreshed.tools_supported;
         }
         if config.max_sequence_length.is_some() {
             existing.max_sequence_length = refreshed.max_sequence_length;
+        }
+        // M10 follow-up: ``lora_adapters`` and ``profile_lora_adapters``
+        // are derived from ``profiles.*.adapter_options.loadtime.lora_paths``.
+        // A delta config typically only carries the profiles being added
+        // or modified, so recomputing from ``config`` alone would drop
+        // adapters declared on profiles that weren't part of the delta.
+        // We rebuild from the full ``merged_profiles`` set (existing +
+        // incoming) instead so the published capability map matches what
+        // the worker has actually loaded.
+        if touches_profiles {
+            let mut merged_config = config.clone();
+            merged_config.profiles = merged_profiles.clone();
+            let lora_refreshed = ModelInfoExtras::from_model_config(&merged_config);
+            existing.lora_adapters = lora_refreshed.lora_adapters;
+            existing.profile_lora_adapters = lora_refreshed.profile_lora_adapters;
         }
     }
 }
@@ -875,6 +1291,20 @@ mod tests {
         fs::create_dir_all(&bundles_dir).unwrap();
         fs::create_dir_all(&models_dir).unwrap();
         (dir, bundles_dir, models_dir)
+    }
+
+    fn profile(
+        adapter_path: Option<&str>,
+        max_batch_tokens: Option<u32>,
+        extends: Option<&str>,
+    ) -> crate::types::model::ProfileConfig {
+        crate::types::model::ProfileConfig {
+            adapter_path: adapter_path.map(str::to_string),
+            max_batch_tokens,
+            compute_precision: None,
+            adapter_options: None,
+            extends: extends.map(str::to_string),
+        }
     }
 
     #[test]
@@ -926,6 +1356,247 @@ mod tests {
             })
             .unwrap();
         assert!(registry.has_any_models(), "must report populated after add");
+    }
+
+    #[test]
+    fn test_add_model_config_rejects_invalid_profile_name_live_path() {
+        // H-medium: the live delta path (`add_model_config` →
+        // `expand_model_entry_into_profile_variants`) must enforce the
+        // same profile-name allowlist as the file-load path, so a
+        // control-plane delta carrying e.g. `bad/name` is rejected
+        // instead of minting a phantom `{base}:{bad/name}` registry entry.
+        use crate::types::model::{ModelConfig, ProfileConfig};
+        use std::collections::HashMap as StdHashMap;
+
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            "name: default\npriority: 10\nadapters:\n  - sie_server.adapters.sentence_transformer\n",
+        )
+        .unwrap();
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        let mut profiles = StdHashMap::new();
+        profiles.insert(
+            "default".to_string(),
+            ProfileConfig {
+                adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
+                max_batch_tokens: Some(4096),
+                compute_precision: None,
+                adapter_options: None,
+                extends: None,
+            },
+        );
+        // Invalid profile name: contains '/', which would shadow a base
+        // model id when concatenated as `{base}:{profile}`.
+        profiles.insert(
+            "bad/name".to_string(),
+            ProfileConfig {
+                adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
+                max_batch_tokens: Some(4096),
+                compute_precision: None,
+                adapter_options: None,
+                extends: None,
+            },
+        );
+
+        let err = registry
+            .add_model_config(ModelConfig {
+                name: "org/x".to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: None,
+            })
+            .expect_err("invalid profile name must be rejected on the live path");
+        assert!(
+            err.contains("profile name"),
+            "error should mention the profile-name rule, got: {err}"
+        );
+        // And the phantom variant must NOT have been registered.
+        assert!(!registry.model_exists("org/x:bad/name"));
+    }
+
+    #[test]
+    fn test_reload_expands_non_default_profiles_as_variants() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("sglang.yaml"),
+            "name: sglang\npriority: 20\nadapters:\n  - sie_server.adapters.sglang.generation\n",
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("Qwen__Qwen3.5-4B.yaml"),
+            r#"
+sie_id: Qwen/Qwen3.5-4B
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    max_batch_tokens: 8192
+  a100-40gb:
+    extends: default
+    max_batch_tokens: 32768
+"#,
+        )
+        .unwrap();
+
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        assert!(registry.model_exists("Qwen/Qwen3.5-4B"));
+        assert!(registry.model_exists("Qwen/Qwen3.5-4B:a100-40gb"));
+        assert_eq!(
+            registry
+                .resolve_bundle("Qwen/Qwen3.5-4B:a100-40gb", None)
+                .unwrap(),
+            "sglang"
+        );
+        assert_eq!(
+            registry
+                .get_model_info("Qwen/Qwen3.5-4B:a100-40gb")
+                .unwrap()
+                .profile_names,
+            HashSet::from(["default".to_string()])
+        );
+        let variant = registry
+            .get_model_info("Qwen/Qwen3.5-4B:a100-40gb")
+            .unwrap();
+        let default_profile = variant.profile_configs.get("default").unwrap();
+        assert_eq!(
+            default_profile.adapter_path.as_deref(),
+            Some("sie_server.adapters.sglang.generation:SGLangGenerationAdapter")
+        );
+        assert_eq!(default_profile.max_batch_tokens, Some(32768));
+    }
+
+    #[test]
+    fn test_variant_lora_adapters_narrowed_to_variant_profile() {
+        // M10 regression: a non-default profile variant is materialized
+        // as its own ``ModelEntry`` (``{base}:{profile}``). That
+        // variant's ``info_extras`` must advertise / validate against
+        // ONLY the suffix-profile's LoRA adapters — not the union the
+        // base entry carries. Otherwise the gateway accepts an adapter
+        // that's only configured for a sibling profile, and the worker
+        // fails opaquely instead of returning a clean 400.
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("sglang.yaml"),
+            "name: sglang\npriority: 20\nadapters:\n  - sie_server.adapters.sglang.generation\n",
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("acme__multi.yaml"),
+            r#"
+sie_id: acme/multi
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    adapter_options:
+      loadtime:
+        lora_paths:
+          a1: acme/a1
+          a2: acme/a2
+  a100:
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    adapter_options:
+      loadtime:
+        lora_paths:
+          b1: acme/b1
+"#,
+        )
+        .unwrap();
+
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        // Base entry carries the union (back-compat) and the full
+        // per-profile breakdown.
+        let base = registry.get_model_info("acme/multi").unwrap();
+        let mut base_union = base.info_extras.lora_adapters.clone().unwrap();
+        base_union.sort();
+        assert_eq!(
+            base_union,
+            vec!["a1".to_string(), "a2".to_string(), "b1".to_string()]
+        );
+        // Variant entry only sees its own profile's adapters, both in
+        // the union summary AND in the per-profile map (keyed under
+        // ``"default"`` because the variant's profile_configs collapses
+        // the resolved profile to that name).
+        let variant = registry.get_model_info("acme/multi:a100").unwrap();
+        assert_eq!(
+            variant.info_extras.lora_adapters,
+            Some(vec!["b1".to_string()]),
+            "variant lora_adapters union must be narrowed to its profile"
+        );
+        assert_eq!(
+            variant.lora_adapters_for_profile("default"),
+            Some(&vec!["b1".to_string()]),
+            "variant lora_adapters_for_profile(default) must yield the variant's profile adapters"
+        );
+        // Cross-check: requesting the base's adapter through the
+        // variant would now reject (not in the variant's list).
+        assert!(!variant
+            .lora_adapters_for_profile("default")
+            .map(|v| v.iter().any(|s| s == "a1"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn test_reload_rejects_model_with_missing_profile_parent() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            "name: default\npriority: 10\nadapters:\n  - module\n",
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("broken.yaml"),
+            r#"
+name: org/broken
+profiles:
+  child:
+    extends: missing
+    max_batch_tokens: 8192
+"#,
+        )
+        .unwrap();
+
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        assert!(!registry.model_exists("org/broken"));
+        assert!(registry.list_models().is_empty());
+    }
+
+    #[test]
+    fn test_add_model_config_rejects_broken_profile_parent() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            "name: default\npriority: 10\nadapters:\n  - module\n",
+        )
+        .unwrap();
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "child".to_string(),
+            profile(None, Some(8192), Some("missing")),
+        );
+
+        let err = registry
+            .add_model_config(ModelConfig {
+                name: "org/broken".to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: None,
+            })
+            .expect_err("broken profile inheritance must reject the config");
+
+        assert!(err.contains("Profile 'child'"));
+        assert!(err.contains("missing parent or an inheritance cycle"));
+        assert!(!registry.model_exists("org/broken"));
     }
 
     #[test]
@@ -1511,6 +2182,262 @@ adapters:
             created.is_empty(),
             "replay of stored config must not report newly created profiles, got: {created:?}"
         );
+    }
+
+    /// Regression: a delta apply whose new profile ``extends`` a profile that
+    /// only lives in ``existing.profile_configs`` (not in the incoming config)
+    /// must still resolve. Pre-fix this hit "Profile 'a100-40gb' has a missing
+    /// parent or an inheritance cycle" because resolution only walked
+    /// ``config.profiles``.
+    #[test]
+    fn test_add_model_config_delta_resolves_extends_from_existing_profiles() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            r#"
+name: default
+priority: 10
+adapters:
+  - sie_server.adapters.sentence_transformer
+"#,
+        )
+        .unwrap();
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        // Seed: one config carrying the ``default`` profile.
+        registry
+            .add_model_config(cfg_for_test_model(
+                "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter",
+                4096,
+            ))
+            .expect("seed apply with default profile");
+
+        // Delta: a second config bringing only ``a100-40gb`` which extends
+        // ``default``. ``default`` lives only in ``existing.profile_configs``
+        // at this point.
+        let delta = ModelConfig {
+            name: "test/model".to_string(),
+            adapter_module: None,
+            default_bundle: None,
+            profiles: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "a100-40gb".to_string(),
+                    crate::types::model::ProfileConfig {
+                        adapter_path: None,
+                        max_batch_tokens: Some(8192),
+                        compute_precision: None,
+                        adapter_options: None,
+                        extends: Some("default".to_string()),
+                    },
+                );
+                m
+            },
+            inputs: None,
+            max_sequence_length: None,
+            tasks: None,
+        };
+
+        let (created, _skipped, _bundles) = registry
+            .add_model_config(delta.clone())
+            .expect("delta apply must resolve extends against existing.profile_configs");
+        assert_eq!(created, vec!["a100-40gb".to_string()]);
+
+        // Same delta under the authoritative path must also succeed (the
+        // override path uses the same merged resolution map).
+        registry
+            .add_model_config_authoritative(delta)
+            .expect("authoritative replay of the same delta must also resolve cleanly");
+    }
+
+    /// M10 follow-up: a delta-update that adds a profile with new
+    /// ``adapter_options.loadtime.lora_paths`` must refresh both the
+    /// union (`info_extras.lora_adapters`) and the per-profile map
+    /// (`info_extras.profile_lora_adapters`). The previous merge path
+    /// only refreshed inputs/outputs/dims/max_*; LoRA capabilities
+    /// stayed stale until a full reload, so the gateway's capability
+    /// gate could reject a request for an adapter the worker had
+    /// actually loaded after the delta.
+    #[test]
+    fn test_add_model_config_delta_refreshes_lora_capabilities() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            r#"
+name: default
+priority: 10
+adapters:
+  - sie_server.adapters.sentence_transformer
+"#,
+        )
+        .unwrap();
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        // Seed: ``default`` profile with one LoRA adapter ``base-a``.
+        let seed = ModelConfig {
+            name: "test/model".to_string(),
+            adapter_module: None,
+            default_bundle: None,
+            profiles: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "default".to_string(),
+                    crate::types::model::ProfileConfig {
+                        adapter_path: Some(
+                            "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
+                                .to_string(),
+                        ),
+                        max_batch_tokens: Some(4096),
+                        compute_precision: None,
+                        adapter_options: Some(serde_json::json!({
+                            "loadtime": {
+                                "lora_paths": { "base-a": "hf://repo/base-a" },
+                            },
+                        })),
+                        extends: None,
+                    },
+                );
+                m
+            },
+            inputs: None,
+            max_sequence_length: None,
+            tasks: None,
+        };
+        registry.add_model_config(seed).expect("seed");
+
+        // Sanity: union and per-profile map both carry ``base-a`` only.
+        let snap = registry.snapshot.load();
+        let entry = snap
+            .models
+            .get("test/model")
+            .expect("seed produced an entry");
+        assert_eq!(
+            entry.info_extras.lora_adapters.as_deref().unwrap_or(&[]),
+            &["base-a".to_string()],
+        );
+        let per_profile_seed = entry
+            .info_extras
+            .profile_lora_adapters
+            .as_ref()
+            .expect("seed populated profile_lora_adapters");
+        assert_eq!(
+            per_profile_seed.get("default").map(Vec::as_slice),
+            Some(&["base-a".to_string()][..]),
+        );
+
+        // Delta: add ``a100-40gb`` profile with a *different* LoRA
+        // adapter ``a100-adapter``. The merge must surface both
+        // adapters in the union and scope each to its own profile in
+        // the per-profile map. Previously this stayed stale until a
+        // full reload.
+        let delta = ModelConfig {
+            name: "test/model".to_string(),
+            adapter_module: None,
+            default_bundle: None,
+            profiles: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "a100-40gb".to_string(),
+                    crate::types::model::ProfileConfig {
+                        adapter_path: Some(
+                            "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
+                                .to_string(),
+                        ),
+                        max_batch_tokens: Some(8192),
+                        compute_precision: None,
+                        adapter_options: Some(serde_json::json!({
+                            "loadtime": {
+                                "lora_paths": { "a100-adapter": "hf://repo/a100" },
+                            },
+                        })),
+                        extends: None,
+                    },
+                );
+                m
+            },
+            inputs: None,
+            max_sequence_length: None,
+            tasks: None,
+        };
+        registry
+            .add_model_config(delta)
+            .expect("delta adds new profile + lora");
+
+        let snap = registry.snapshot.load();
+        let entry = snap.models.get("test/model").expect("entry survived");
+        let union: Vec<String> = entry
+            .info_extras
+            .lora_adapters
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        // Union now lists both adapters (order is insertion-defined; sort to
+        // compare).
+        let mut union_sorted = union;
+        union_sorted.sort();
+        assert_eq!(
+            union_sorted,
+            vec!["a100-adapter".to_string(), "base-a".to_string()],
+            "delta-update did not refresh the union of lora_adapters",
+        );
+        let per_profile = entry
+            .info_extras
+            .profile_lora_adapters
+            .as_ref()
+            .expect("profile_lora_adapters present");
+        assert_eq!(
+            per_profile.get("default").map(Vec::as_slice),
+            Some(&["base-a".to_string()][..]),
+            "delta-update wiped the existing default profile's adapter list",
+        );
+        assert_eq!(
+            per_profile.get("a100-40gb").map(Vec::as_slice),
+            Some(&["a100-adapter".to_string()][..]),
+            "delta-update did not add the new profile's adapter",
+        );
+    }
+
+    #[test]
+    fn test_add_model_config_authoritative_rebuilds_adapter_modules() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("old.yaml"),
+            r#"
+name: old
+priority: 10
+adapters:
+  - old.adapter
+"#,
+        )
+        .unwrap();
+        fs::write(
+            bundles_dir.join("new.yaml"),
+            r#"
+name: new
+priority: 10
+adapters:
+  - new.adapter
+"#,
+        )
+        .unwrap();
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        registry
+            .add_model_config(cfg_for_test_model("old.adapter:Adapter", 4096))
+            .expect("seed apply");
+        assert_eq!(registry.resolve_bundle("test/model", None).unwrap(), "old");
+
+        registry
+            .add_model_config_authoritative(cfg_for_test_model("new.adapter:Adapter", 4096))
+            .expect("authoritative apply must move adapter module");
+
+        let entry = registry.get_model_info("test/model").unwrap();
+        assert_eq!(
+            entry.adapter_modules,
+            HashSet::from(["new.adapter".to_string()])
+        );
+        assert_eq!(registry.resolve_bundle("test/model", None).unwrap(), "new");
     }
 
     #[test]

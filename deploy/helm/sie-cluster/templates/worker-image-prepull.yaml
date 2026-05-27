@@ -3,9 +3,11 @@
 {{- range $poolName, $pool := .Values.workers.pools }}
 {{- if $pool.enabled }}
 {{- $bundle := default $root.Values.workers.common.bundle $pool.bundle }}
+{{- /* See worker-statefulset.yaml for the imageBundle rationale. */ -}}
+{{- $imageBundle := default $bundle (default $root.Values.workers.common.imageBundle $pool.imageBundle) }}
 {{- $platform := default $root.Values.workers.common.platform $pool.platform }}
 {{- $imageTag := default $root.Chart.AppVersion $root.Values.workers.common.image.tag }}
-{{- $workerImage := printf "%s:%s-%s-%s" $root.Values.workers.common.image.repository $imageTag $platform $bundle }}
+{{- $workerImage := printf "%s:%s-%s-%s" $root.Values.workers.common.image.repository $imageTag $platform $imageBundle }}
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -54,7 +56,21 @@ spec:
             limits:
               cpu: "10m"
               memory: "16Mi"
-      {{- with $pool.nodeSelector }}
+      {{- /*
+        Pin the prepull DS to the same physical nodes as the workers it pre-warms.
+        Without a nodeSelector the DS lands on every node (including small system nodes)
+        and the large worker image exhausts ephemeral storage, triggering DiskPressure
+        and evictions of co-located pods. The sie.superlinked.com/gpu-type label is
+        set by both the AWS and GCP terraform modules on GPU node groups.
+      */ -}}
+      {{- $prepullNodeSelector := dict }}
+      {{- if $pool.gpuType }}
+      {{- $_ := set $prepullNodeSelector "sie.superlinked.com/gpu-type" $pool.gpuType }}
+      {{- end }}
+      {{- range $k, $v := $pool.nodeSelector }}
+      {{- $_ := set $prepullNodeSelector $k $v }}
+      {{- end }}
+      {{- with $prepullNodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}

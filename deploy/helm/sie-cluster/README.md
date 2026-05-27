@@ -136,16 +136,41 @@ autoscaling:
   cooldownPeriod: 600  # 10 min before scale-down
 ```
 
+## Ingress
+
+Enable the Ingress with `ingress.enabled=true` and route traffic to the gateway by
+hostname. Use the list-valued `ingress.hosts` to front the gateway with one or more
+hostnames — each entry becomes an Ingress rule (and, when TLS is enabled, a SAN on
+the cert):
+
+```yaml
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - sie.example.com
+    - api.example.com
+```
+
+The singular `ingress.host` is the backward-compatible single-host shorthand; it is
+ignored whenever `ingress.hosts` is non-empty. With neither set the chart renders a
+host-less catch-all Ingress. All hosts share the single `ingress.tls.secretName`
+(one multi-SAN certificate).
+
 ## TLS / HTTPS
 
-The chart supports two TLS modes for the Ingress (set via `ingress.tls.mode`):
+The chart supports four TLS modes for the Ingress (set via `ingress.tls.mode`):
 
 - `byo` — bring your own `kubernetes.io/tls` Secret (default, backward compatible).
-- `cert-manager` — chart annotates the Ingress; [cert-manager](https://cert-manager.io/) provisions and renews the certificate via ACME (HTTP-01 challenge to Let's Encrypt by default).
+- `cert-manager` — chart annotates the Ingress; [cert-manager](https://cert-manager.io/) provisions and renews the certificate. Default flavour is ACME (HTTP-01 challenge to Let's Encrypt); you can also point at an existing internal Issuer/ClusterIssuer.
+- `self-signed` — chart bootstraps a self-signed root CA, a CA ClusterIssuer, and a leaf cert for the Ingress. Intended for air-gapped / on-prem / VPC-isolated clusters where Let's Encrypt is unreachable.
+- `disabled` — no TLS resources rendered. Use when TLS is terminated upstream (cloud load balancer, sidecar, service mesh).
+
+> **Exactly one cert-manager per cluster.** cert-manager's CRDs, webhooks, and `cert-manager` ClusterRoleBinding are cluster-scoped singletons. Two controllers racing on the same CRDs corrupt issuance state. The chart enforces this with a pre-install Job that aborts when bundled cert-manager would collide with an existing install — see "Bundling cert-manager" below.
 
 Only HTTP-01 ACME challenges are supported by the chart. DNS-01 / wildcard certs (which require cloud-provider IRSA / Workload Identity for Route53 / Cloud DNS) are out of scope — set them up manually outside the chart and reference the resulting Secret via `mode: byo`.
 
-### BYO certificate
+### `mode: byo` — bring-your-own certificate
 
 Create the TLS Secret yourself (e.g. from a corporate CA, ACM cert exported to a Secret, or an existing wildcard cert), then point the chart at it:
 
@@ -164,9 +189,13 @@ ingress:
     secretName: sie-tls  # default
 ```
 
-### cert-manager + Let's Encrypt
+**When to use this**: you already manage TLS centrally, or you have a wildcard cert from a corporate CA, or you need DNS-01 / non-ACME issuance.
 
-Prerequisite: install cert-manager once in the cluster (its CRDs are cluster-scoped and must exist exactly once — that's why it is **not** bundled as a subchart):
+### `mode: cert-manager` — automated issuance via cert-manager
+
+Prerequisite: either install cert-manager once in the cluster (its CRDs are cluster-scoped and must exist exactly once), OR opt in to the bundled subchart (see "Bundling cert-manager" below — single-tenant clusters only).
+
+External install (recommended for shared clusters):
 
 ```bash
 helm repo add jetstack https://charts.jetstack.io && helm repo update
@@ -201,9 +230,7 @@ Issuer kind tradeoff:
 - `ClusterIssuer` — single ACME account / private key shared across all namespaces. Best for shared clusters.
 - `Issuer` — namespace-scoped. Use for hard tenant isolation, or when you don't have permission to create cluster-scoped resources.
 
-### Reusing an existing ClusterIssuer/Issuer
-
-In multi-tenant clusters where a platform team already manages a shared `ClusterIssuer`, set `create: false` and reference it by name:
+**Reusing an existing ClusterIssuer/Issuer.** In multi-tenant clusters where a platform team already manages a shared `ClusterIssuer`, set `create: false` and reference it by name:
 
 ```yaml
 ingress:
@@ -217,6 +244,131 @@ ingress:
 ```
 
 The chart only adds the annotation — it does not render any Issuer resource.
+
+**When to use this**: ACME / Let's Encrypt is reachable from your cluster (or you already have an internal Issuer/ClusterIssuer) and your platform team is OK with cert-manager being installed.
+
+### `mode: self-signed` — self-signed CA (air-gapped / on-prem)
+
+For clusters that cannot reach Let's Encrypt — typical for on-prem, regulated, or VPC-isolated environments — the chart can bootstrap a self-signed root CA and use it to issue the Ingress leaf cert. cert-manager is still required.
+
+```yaml
+certManagerBundle:
+  certManager:
+    install: true      # bundle cert-manager (SINGLE-TENANT clusters only — see warning above)
+
+ingress:
+  enabled: true
+  className: nginx
+  host: sie.example.com
+  tls:
+    enabled: true
+    mode: self-signed
+    secretName: sie-tls
+    selfSigned:
+      rootCA:
+        commonName: "Acme Corp SIE Root CA"
+        # 43800h = 5y, 720h = 30d renewBefore
+      leaf:
+        # 2160h = 90d, 360h = 15d renewBefore — match Let's Encrypt lifetimes
+        dnsNames: []   # extra SANs in addition to ingress.host
+        ipAddresses: []
+```
+
+Chain:
+
+1. `SelfSigned` ClusterIssuer (bootstrap, name `{fullname}-selfsigned-bootstrap`).
+2. Root CA `Certificate` (`{fullname}-root-ca`, isCA, 5y, RSA-4096) -> Secret `sie-root-ca-key-pair`.
+3. CA `ClusterIssuer` (`sie-self-signed-ca`) backed by the root CA secret.
+4. Ingress leaf `Certificate` (`{fullname}-ingress-leaf`, ECDSA-P256, 90d) -> Secret `sie-tls`, consumed by the Ingress.
+
+Clients (browsers, curl) must trust the root CA. Export it with:
+
+```bash
+kubectl -n sie get secret sie-root-ca-key-pair \
+  -o jsonpath='{.data.ca\.crt}' | base64 -d > sie-root-ca.crt
+```
+
+> **Root CA namespace constraint.** Two independent namespace-scoped lookups apply:
+>
+> 1. **cert-manager** only resolves Secrets referenced by a `ClusterIssuer` inside its `--cluster-resource-namespace` (defaults to its own Deployment's namespace). The chart writes the root CA to `ingress.tls.selfSigned.rootCA.namespace` (defaults to the release namespace, which is correct for the **bundled** subchart since cert-manager also runs in the release namespace).
+> 2. **trust-manager** only resolves source Secrets for `Bundle` resources inside its `--trust-namespace` (defaults to `cert-manager`, regardless of where trust-manager itself runs).
+>
+> If you also enable `certManagerBundle.trustBundle.enabled: true` with the bundled trust-manager, override the trust namespace at install time so it matches where the root CA lives:
+>
+> ```bash
+> helm install ... --set "trust-manager.app.trust.namespace=<release-namespace>"
+> ```
+>
+> Otherwise the Bundle stays `Synced=False` with `SourceNotFound`. For external cert-manager (typically in `cert-manager` namespace), set `ingress.tls.selfSigned.rootCA.namespace: cert-manager` so the CA `ClusterIssuer` can find its Secret; the default trust-namespace then already matches.
+
+**When to use this**: air-gapped / on-prem clusters where you can distribute the root CA to client machines (e.g. via MDM, internal trust store, or workload mount), and you want a single `helm install` to land a working HTTPS path.
+
+### `mode: disabled` — no TLS resources
+
+Use when TLS is terminated upstream of the Ingress (cloud LB, sidecar, service mesh):
+
+```yaml
+ingress:
+  enabled: true
+  className: nginx
+  host: sie.example.com
+  tls:
+    enabled: false
+    mode: disabled
+```
+
+### Trust distribution with trust-manager
+
+When `mode: self-signed`, you can replicate the root CA into other namespaces as a ConfigMap so non-SIE workloads can trust SIE without out-of-band copying.
+
+```yaml
+certManagerBundle:
+  trustManager:
+    install: true      # required when not already installed externally
+  trustBundle:
+    enabled: true
+    name: sie-root-ca-bundle
+    target:
+      configMapKey: ca.crt
+    namespaceSelector:
+      matchLabels:
+        sie.io/trust: "true"  # label target namespaces to opt them in
+```
+
+Workloads mount the resulting ConfigMap and point their HTTP client at it as the CA bundle.
+
+### Bundling cert-manager
+
+The chart can install cert-manager and trust-manager as opt-in subchart dependencies (default off). **This is reserved for single-tenant clusters where SIE is the sole workload.** In any multi-tenant or shared cluster, install cert-manager once out-of-band and leave `certManagerBundle.certManager.install: false`.
+
+Guards:
+
+1. Both subcharts are gated by `*.install` flags that default to `false`; default chart behaviour is unchanged.
+2. A template-time `lookup` aborts the install when `certManagerBundle.certManager.install: true` is combined with an existing `certificates.cert-manager.io` CRD.
+3. A `pre-install` Job hook re-checks at apply time and aborts before any subchart resources are created (`lookup` returns empty during `helm template` / `--dry-run`, so the Job is the real safety net).
+4. Jetstack's `crds.keep: true` default is left in place, so `helm uninstall` does not silently delete `Certificate` / `Issuer` resources belonging to other operators.
+
+Override the conflict guard (DANGER):
+
+```yaml
+certManagerBundle:
+  allowExistingCRDs: true   # bypass both guards; only if you accept the consequences
+```
+
+#### Vendored CRDs
+
+cert-manager and trust-manager CRDs are vendored at `deploy/helm/sie-cluster/crds/`. Helm applies files in a chart's `crds/` directory **before** rendering templates, which is the only mechanism that lets bundled mode complete in a single `helm install` (the subcharts' own templated CRDs would land too late — Helm's RESTMapper discovery runs at install start and fails to resolve `Certificate` / `Bundle` references). Both subcharts have `crds.enabled: false` set in `values.yaml` so they don't try to re-install the same CRDs.
+
+The vendored bundles are pinned to the same version as the subchart pins in `Chart.yaml`:
+
+- `crds/cert-manager.crds.yaml` — fetched from the cert-manager release: `curl -fsSL -o crds/cert-manager.crds.yaml https://github.com/cert-manager/cert-manager/releases/download/v<X.Y.Z>/cert-manager.crds.yaml`
+- `crds/trust-manager.crds.yaml` — extracted from the subchart tarball: `helm template trust-manager charts/trust-manager-v<X.Y.Z>.tgz --show-only templates/crd-trust.cert-manager.io_bundles.yaml > crds/trust-manager.crds.yaml`
+
+When bumping the subchart version pin in `Chart.yaml`, re-vendor both files and re-run the golden-diff tests to surface CRD schema changes.
+
+### Uninstall caveat
+
+`crds.keep: true` is the Jetstack default. `helm uninstall sie-cluster` will **leave cert-manager CRDs behind on purpose**, so that `Certificate` / `Issuer` resources owned by other operators are not silently deleted. To remove them, run `kubectl delete crd <name>.cert-manager.io <name>.acme.cert-manager.io <name>.trust.cert-manager.io ...` explicitly. See the [cert-manager uninstall docs](https://cert-manager.io/docs/installation/helm/#uninstalling) for the full CRD list.
 
 ## Gated Models
 
@@ -314,7 +466,7 @@ telemetry:
 
 ## Observability
 
-Observability components (Prometheus, Grafana, Loki, DCGM Exporter, Alloy, Event Exporter) are included as optional sub-chart dependencies. Enable them in your values overlay (e.g. `kube-prometheus-stack.install: true`).
+Observability components (Prometheus, Grafana, Loki, DCGM Exporter, Alloy, Event Exporter) are included as optional sub-chart dependencies. Enable them in your values overlay (e.g. `kube-prometheus-stack.install: true`, `observability.logs.install: true`, or `kubernetes-event-exporter.install: true`).
 
 Pre-configured dashboards:
 

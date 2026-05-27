@@ -177,6 +177,17 @@ Gateway service name (used for worker discovery)
 {{- end }}
 
 {{/*
+In-cluster URL used by workers to ask the gateway whether they are admitted
+to pull from their configured queue pool.
+*/}}
+{{- define "sie-cluster.gateway.internalUrl" -}}
+{{- $svc := include "sie-cluster.gateway.serviceName" . }}
+{{- $ns := include "sie-cluster.namespace" . }}
+{{- $port := .Values.gateway.service.port | default 8080 }}
+{{- printf "http://%s.%s.svc.cluster.local:%v" $svc $ns $port }}
+{{- end }}
+
+{{/*
 OAuth2 proxy service name
 */}}
 {{- define "sie-cluster.oauth2Proxy.serviceName" -}}
@@ -226,6 +237,14 @@ Budget: prefix (≤49) + "-health-config" (14) = 63 (DNS-1123 label max).
 {{- end }}
 
 {{/*
+Pre-install hook: cert-manager conflict-check SA name.
+Budget: prefix (≤45) + "-cm-conflict-check" (18) = 63 (DNS-1123 label max).
+*/}}
+{{- define "sie-cluster.certManagerConflict.serviceAccountName" -}}
+{{- printf "%s-cm-conflict-check" (include "sie-cluster.fullname" . | trunc 45 | trimSuffix "-") }}
+{{- end }}
+
+{{/*
 Validation: NATS install/enabled consistency.
 Fails if nats.install=true but nats.enabled=false (NATS deploys but nothing connects).
 */}}
@@ -239,18 +258,76 @@ Fails if nats.install=true but nats.enabled=false (NATS deploys but nothing conn
 {{- end }}
 
 {{/*
-Validation: TLS configuration consistency.
+Effective ingress hostnames as a JSON array.
+Prefers the list `ingress.hosts`; falls back to the singular `ingress.host`
+(backward compatible). Empty array => host-less catch-all ingress.
+Consume with: include "sie-cluster.ingress.hosts" . | fromJsonArray
+*/}}
+{{- define "sie-cluster.ingress.hosts" -}}
+{{- $hosts := list -}}
+{{- if .Values.ingress.hosts -}}
+{{- range .Values.ingress.hosts -}}
+{{- $h := trim . -}}
+{{- if $h -}}
+{{- $hosts = append $hosts $h -}}
+{{- end -}}
+{{- end -}}
+{{- else if .Values.ingress.host -}}
+{{- $h := trim .Values.ingress.host -}}
+{{- if $h -}}
+{{- $hosts = list $h -}}
+{{- end -}}
+{{- end -}}
+{{- $hosts | toJson -}}
+{{- end -}}
+
+{{/*
+Validation: TLS / cert-manager / trust-manager configuration consistency.
 Runs from NOTES.txt so every install/upgrade is checked, regardless of which (or no) Issuer template renders.
 */}}
 {{- define "sie-cluster.validateTls" -}}
+{{- /* CRD existence is no longer a reliable "is cert-manager installed" signal — we vendor the
+       cert-manager and trust-manager CRDs under crds/, so the CRD lands on every install regardless
+       of whether a cert-manager Deployment exists. Helm's lookup() can't filter by label, so we
+       enumerate every Deployment cluster-wide (lookup with empty namespace = all namespaces) and
+       match any whose `app.kubernetes.io/name` label is "cert-manager" / "trust-manager". That
+       catches the standard `helm install cert-manager` release name, non-standard names like
+       `cert-manager-upstream`, AND installs in unconventional namespaces. Empty under
+       `helm template` / `--dry-run`; the pre-install Job hook is the real safety net at apply
+       time. */ -}}
+{{- $cmDeploy := "" }}
+{{- $tmDeploy := "" }}
+{{- range $d := (lookup "apps/v1" "Deployment" "" "").items }}
+{{- /* Deployments without any labels return metadata.labels=nil; `index nil` errors
+       ("index of untyped nil"), unlike `index <map> <missing-key>` which yields "".
+       Default to an empty dict so the probe simply skips unlabeled deployments. */ -}}
+{{- $labels := $d.metadata.labels | default dict }}
+{{- $name := index $labels "app.kubernetes.io/name" }}
+{{- if eq $name "cert-manager" }}{{- $cmDeploy = $d }}{{- end }}
+{{- if eq $name "trust-manager" }}{{- $tmDeploy = $d }}{{- end }}
+{{- end }}
+{{- $cmInstall := .Values.certManagerBundle.certManager.install }}
+{{- $tmInstall := .Values.certManagerBundle.trustManager.install }}
+{{- if $cmInstall }}
+{{- if and $cmDeploy (not .Values.certManagerBundle.allowExistingCRDs) }}
+{{- fail "Refusing to install bundled cert-manager: a cert-manager Deployment already exists in the cluster. Two cert-manager controllers reconciling the same CRDs will corrupt issuance state. Remediation: (a) set certManagerBundle.certManager.install=false and use ingress.tls.mode=cert-manager against the existing install, OR (b) uninstall the existing cert-manager first, OR (c) set certManagerBundle.allowExistingCRDs=true (DANGEROUS — only if you understand the consequences)." }}
+{{- end }}
+{{- end }}
+{{- /* Note: we deliberately do NOT fail here when (mode=self-signed | trustManager.install=true |
+       trustBundle.enabled=true) is set but no cert-manager is found via lookup. helm template
+       intentionally returns empty for lookup(), so a fail here would false-positive every preview
+       render against a cluster that does have an external cert-manager. The runtime conflict-check
+       Job hook is the authoritative apply-time check; if cert-manager truly isn't present at apply
+       time, the cert-manager.io / trust.cert-manager.io resources will fail to reconcile and
+       surface in `kubectl get certificate`. */ -}}
 {{- if .Values.ingress.tls.enabled }}
 {{- $mode := .Values.ingress.tls.mode }}
-{{- if not (or (eq $mode "byo") (eq $mode "cert-manager")) }}
-{{- fail (printf "Invalid configuration: ingress.tls.mode=%q. Must be one of: \"byo\", \"cert-manager\"." $mode) }}
+{{- if not (or (eq $mode "byo") (eq $mode "cert-manager") (eq $mode "self-signed") (eq $mode "disabled")) }}
+{{- fail (printf "Invalid configuration: ingress.tls.mode=%q. Must be one of: \"byo\", \"cert-manager\", \"self-signed\", \"disabled\"." $mode) }}
 {{- end }}
 {{- if eq $mode "cert-manager" }}
-{{- if not .Values.ingress.host }}
-{{- fail "Invalid configuration: ingress.tls.mode=cert-manager requires ingress.host to be set (cert-manager has nothing to issue a certificate against without a hostname)." }}
+{{- if not (include "sie-cluster.ingress.hosts" . | fromJsonArray) }}
+{{- fail "Invalid configuration: ingress.tls.mode=cert-manager requires ingress.host or ingress.hosts to be set (cert-manager has nothing to issue a certificate against without a hostname)." }}
 {{- end }}
 {{- $kind := .Values.ingress.tls.certManager.kind }}
 {{- if not (or (eq $kind "ClusterIssuer") (eq $kind "Issuer")) }}
@@ -270,6 +347,12 @@ Runs from NOTES.txt so every install/upgrade is checked, regardless of which (or
 {{- if not .Values.ingress.tls.certManager.name }}
 {{- fail "Invalid configuration: ingress.tls.certManager.create=false requires ingress.tls.certManager.name to be set (without a name there is no existing Issuer/ClusterIssuer to annotate against)." }}
 {{- end }}
+{{- end }}
+{{- end }}
+{{- if eq $mode "self-signed" }}
+{{- $hosts := include "sie-cluster.ingress.hosts" . | fromJsonArray }}
+{{- if and (empty $hosts) (empty .Values.ingress.tls.selfSigned.leaf.dnsNames) (empty .Values.ingress.tls.selfSigned.leaf.ipAddresses) }}
+{{- fail "Invalid configuration: ingress.tls.mode=self-signed requires at least one of ingress.hosts (or ingress.host), ingress.tls.selfSigned.leaf.dnsNames, or ingress.tls.selfSigned.leaf.ipAddresses to be set (the leaf certificate needs at least one SAN)." }}
 {{- end }}
 {{- end }}
 {{- end }}

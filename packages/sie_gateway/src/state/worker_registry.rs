@@ -6,11 +6,68 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use tokio::sync::RwLock;
 
+use crate::routing::hrw::RingSnapshot;
 use crate::types::{
     ClusterStatus, ModelInfo, WorkerHealth, WorkerInfo, WorkerState, WorkerStatusMessage,
 };
 
+/// Strip a `:profile` routing suffix down to the base model id.
+///
+/// Profile variants live in the model registry as `format!("{base}:{profile}")`
+/// (see `model_registry::expand_*`), but workers advertise only the base
+/// model name in their `loaded_models`. HuggingFace model ids never
+/// contain `:`, so the first `:` unambiguously separates the base id from
+/// the profile. Returns `model` unchanged when there is no suffix.
+fn base_model_id(model: &str) -> &str {
+    model.split_once(':').map_or(model, |(base, _)| base)
+}
+
+/// Rate-limit gate for the duplicate-worker-name warning, in whole
+/// seconds since process start. `ring_snapshot_for` runs on the
+/// per-request hot path, so an unconditional `warn!` on a persistent
+/// operator misconfiguration would flood the log. Emit at most once per
+/// `DUP_NAME_WARN_INTERVAL` regardless of how many requests observe it.
+static LAST_DUP_NAME_WARN_SECS: AtomicU64 = AtomicU64::new(0);
+const DUP_NAME_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Warn (rate-limited) that the ring snapshot dropped `dropped` entries
+/// because two or more workers advertised the same `name`. This is an
+/// operator misconfiguration: worker `name` doubles as the HRW ring key
+/// and per-worker subject id, so duplicates collapse onto one subject.
+fn warn_duplicate_worker_names(model: &str, pool: &str, dropped: usize) {
+    use std::sync::OnceLock;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let now_secs = START.get_or_init(Instant::now).elapsed().as_secs();
+    let last = LAST_DUP_NAME_WARN_SECS.load(Ordering::Relaxed);
+    if now_secs.saturating_sub(last) < DUP_NAME_WARN_INTERVAL.as_secs() && last != 0 {
+        return;
+    }
+    // Best-effort CAS: a lost race just means another thread already
+    // warned within the window, which is the behaviour we want.
+    if LAST_DUP_NAME_WARN_SECS
+        .compare_exchange(last, now_secs.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        tracing::warn!(
+            model = %model,
+            pool = %pool,
+            dropped = dropped,
+            "duplicate worker names in HRW ring — operator misconfig; \
+             dedup kept the lowest-url entry per name (worker `name` must \
+             be unique: it is the ring key and per-worker subject id)"
+        );
+    }
+}
+
 pub type OnWorkerHealthy = Arc<dyn Fn(&WorkerState) + Send + Sync>;
+/// Fired when a worker transitions out of the
+/// "eligible for HRW dispatch" set. Two triggers:
+/// 1. `mark_unhealthy` (explicit health failure).
+/// 2. Saturation rising edge — `saturated` flipped from `false` to `true`.
+///
+/// Used by the proxy/publisher to invalidate cached per-`(model, pool)`
+/// ring snapshots and (optionally) to log a structured trace.
+pub type OnWorkerDegraded = Arc<dyn Fn(&WorkerState) + Send + Sync>;
 
 /// Pre-computed snapshot of healthy workers, indexed by bundle.
 /// Rebuilt on every worker state change and swapped atomically via Arc.
@@ -49,6 +106,7 @@ pub struct WorkerRegistry {
     workers: RwLock<HashMap<String, WorkerState>>,
     heartbeat_timeout: Duration,
     on_worker_healthy: Option<OnWorkerHealthy>,
+    on_worker_degraded: Option<OnWorkerDegraded>,
     /// Pre-computed snapshot for lock-free select_worker lookups.
     snapshot: ArcSwap<RegistrySnapshot>,
 
@@ -65,11 +123,31 @@ pub struct WorkerRegistry {
 }
 
 impl WorkerRegistry {
+    /// Construct without a degrade callback. The main gateway uses
+    /// [`Self::with_callbacks`] directly so the dead-code lint fires
+    /// here under default-feature builds; tests and other binaries
+    /// still use this wrapper as the ergonomic no-degrade-callback
+    /// entry point.
+    #[allow(dead_code)]
     pub fn new(heartbeat_timeout: Duration, on_worker_healthy: Option<OnWorkerHealthy>) -> Self {
+        Self::with_callbacks(heartbeat_timeout, on_worker_healthy, None)
+    }
+
+    /// Same as [`Self::new`] but also accepts an
+    /// [`OnWorkerDegraded`] callback fired on health → unhealthy and
+    /// saturation false → true transitions. Used by the HRW
+    /// ring cache invalidation; pre-direct-dispatch callers can keep using
+    /// [`Self::new`].
+    pub fn with_callbacks(
+        heartbeat_timeout: Duration,
+        on_worker_healthy: Option<OnWorkerHealthy>,
+        on_worker_degraded: Option<OnWorkerDegraded>,
+    ) -> Self {
         Self {
             workers: RwLock::new(HashMap::new()),
             heartbeat_timeout,
             on_worker_healthy,
+            on_worker_degraded,
             snapshot: ArcSwap::from_pointee(RegistrySnapshot::default()),
             request_count: AtomicU64::new(0),
             last_qps_calculation: RwLock::new(Instant::now()),
@@ -93,7 +171,7 @@ impl WorkerRegistry {
     }
 
     pub async fn update_worker(&self, url: &str, msg: WorkerStatusMessage) -> bool {
-        let (became_healthy, worker_copy) = {
+        let (became_healthy, became_degraded, worker_copy) = {
             let mut workers = self.workers.write().await;
             let exists = workers.contains_key(url);
             let w = workers
@@ -112,9 +190,11 @@ impl WorkerRegistry {
                     memory_total_bytes: 0,
                     last_heartbeat: Instant::now(),
                     pool_name: String::new(),
+                    saturated: false,
                 });
 
             let was_healthy = w.healthy();
+            let was_eligible = w.eligible_for_dispatch();
 
             w.name = if msg.name.is_empty() {
                 url.to_string()
@@ -150,21 +230,57 @@ impl WorkerRegistry {
 
             w.last_heartbeat = Instant::now();
 
+            // A worker that heartbeats `ready: false` is no longer serviceable
+            // and must leave the dispatch set / HRW ring promptly — waiting for
+            // the heartbeat timeout would keep routing direct dispatches to a
+            // worker that has declared itself not ready. The exact transition
+            // depends on its prior state (see the per-branch notes below).
             if msg.ready {
                 w.health = WorkerHealth::Healthy;
-            } else if w.health != WorkerHealth::Healthy {
-                w.health = WorkerHealth::Unknown;
+            } else if w.health == WorkerHealth::Healthy {
+                // Was serving and now reports not-ready: the worker has
+                // regressed (e.g. a wedged GPU per issue #1025, or draining for
+                // shutdown). Heartbeats keep arriving, so the heartbeat-timeout
+                // path won't catch it — downgrade explicitly so cluster-status
+                // and routing stop treating it as healthy.
+                w.health = WorkerHealth::Unhealthy;
             }
+            // else: leave the current state unchanged. A worker that never
+            // became healthy stays Unknown (still starting up); one already
+            // downgraded to Unhealthy stays Unhealthy on every subsequent
+            // not-ready heartbeat instead of flipping back to Unknown, so a
+            // persistently wedged worker keeps reporting as regressed (#1025).
+
+            // Ingest the saturation flag verbatim. The
+            // worker owns hysteresis; the gateway just consumes the
+            // boolean and fires the degrade callback on the rising
+            // edge so the HRW ring cache can invalidate.
+            w.saturated = msg.saturated;
 
             let became_healthy = msg.ready && (!exists || !was_healthy);
+            // Falling edge into "ineligible for HRW dispatch", reported
+            // exactly once so the degrade callback (ring invalidation)
+            // fires the same way regardless of the trigger. Two triggers
+            // are folded here so we don't double-fire:
+            //   * not-ready demotion (healthy → Unhealthy), and
+            //   * saturation rising edge (was eligible, now saturated).
+            // `mark_unhealthy` reports explicit health failures on its
+            // own falling edge; this path covers the heartbeat-driven
+            // `ready: false` and saturation transitions.
+            let became_degraded = was_eligible && !w.eligible_for_dispatch();
             let worker_copy = w.clone();
             // Rebuild snapshot inside write lock — lock-free ArcSwap, no deadlock
             self.rebuild_snapshot(&workers);
-            (became_healthy, worker_copy)
+            (became_healthy, became_degraded, worker_copy)
         };
 
         if became_healthy {
             if let Some(cb) = &self.on_worker_healthy {
+                cb(&worker_copy);
+            }
+        }
+        if became_degraded {
+            if let Some(cb) = &self.on_worker_degraded {
                 cb(&worker_copy);
             }
         }
@@ -179,11 +295,87 @@ impl WorkerRegistry {
     }
 
     pub async fn mark_unhealthy(&self, url: &str) {
-        let mut workers = self.workers.write().await;
-        if let Some(w) = workers.get_mut(url) {
-            w.health = WorkerHealth::Unhealthy;
+        let (degraded_copy,) = {
+            let mut workers = self.workers.write().await;
+            let copy = if let Some(w) = workers.get_mut(url) {
+                let was_eligible = w.eligible_for_dispatch();
+                w.health = WorkerHealth::Unhealthy;
+                // Only report degradation on the falling edge.
+                if was_eligible {
+                    Some(w.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            self.rebuild_snapshot(&workers);
+            (copy,)
+        };
+        if let Some(w) = degraded_copy {
+            if let Some(cb) = &self.on_worker_degraded {
+                cb(&w);
+            }
         }
-        self.rebuild_snapshot(&workers);
+    }
+
+    /// Dispatch-eligible workers for a `(model, pool)` —
+    /// healthy, not saturated, with `model` in `loaded_models` and
+    /// `pool_name` matching `pool`. Pool match is case-insensitive
+    /// to mirror [`resolve_queue_pool_matching`]. Used by the proxy
+    /// to build per-request HRW snapshots.
+    ///
+    /// A `model:profile` request is matched against the **base** model
+    /// id: workers advertise only base model names in `loaded_models`
+    /// (the `:profile` variant is a registry-only routing concept — the
+    /// adapter is selected per-request, not per-loaded-model), so without
+    /// stripping the suffix a `model:profile` request would never find an
+    /// eligible worker and would always fall through to the pool subject
+    /// (mislabelled `unhealthy_skipped`). HF model ids never contain `:`,
+    /// so the suffix split is unambiguous.
+    pub fn dispatch_workers_for(&self, model: &str, pool: &str) -> Vec<WorkerState> {
+        let base_model = base_model_id(model);
+        let snap = self.snapshot.load();
+        snap.all_healthy
+            .iter()
+            .filter(|w| {
+                !w.saturated
+                    && w.pool_name.eq_ignore_ascii_case(pool)
+                    && w.models.iter().any(|m| m.eq_ignore_ascii_case(base_model))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Build a [`RingSnapshot`] for the given `(model, pool)`. Uses
+    /// the worker `name` (direct-dispatch worker_id convention) as the ring
+    /// key; the same name shows up on the per-worker NATS subject
+    /// `sie.work.{model}.{pool}.{worker_id}`.
+    ///
+    /// The output is sorted by worker name so HRW tie-breaks are
+    /// identical across gateway replicas regardless of the upstream
+    /// `HashMap` iteration order in [`RegistrySnapshot::build`].
+    ///
+    /// Worker `name` is operator-set and has no uniqueness guarantee. Two
+    /// workers sharing a `name` would hash to the same `worker_id_hash`
+    /// and tie-break equally, making the HRW pick ambiguous and pointing
+    /// both at the same per-worker subject. We therefore dedup ring
+    /// entries by `name`, keeping the one whose `url` sorts first so the
+    /// choice is deterministic across replicas, and warn (rate-limited)
+    /// that an operator misconfiguration was observed. The wire-level
+    /// subject format is unchanged — only which workers enter the ring.
+    pub fn ring_snapshot_for(&self, model: &str, pool: &str) -> RingSnapshot {
+        let mut workers = self.dispatch_workers_for(model, pool);
+        // Sort by `(name, url)` so duplicate names are adjacent and the
+        // smallest-`url` entry comes first within each name group.
+        workers.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.url.cmp(&b.url)));
+        let before = workers.len();
+        // Keep the first entry per `name` (smallest `url`).
+        workers.dedup_by(|a, b| a.name == b.name);
+        if workers.len() != before {
+            warn_duplicate_worker_names(model, pool, before - workers.len());
+        }
+        RingSnapshot::new(workers.into_iter().map(|w| w.name))
     }
 
     pub async fn check_heartbeats(&self) -> Vec<String> {
@@ -200,12 +392,6 @@ impl WorkerRegistry {
             self.rebuild_snapshot(&workers);
         }
         unhealthy
-    }
-
-    /// Resolve the NATS pool name for queue mode routing.
-    /// Finds a healthy worker matching the bundle (and optionally GPU) that has a pool_name set.
-    pub async fn resolve_queue_pool(&self, bundle: &str, gpu: &str) -> Option<String> {
-        self.resolve_queue_pool_matching(bundle, gpu, None)
     }
 
     /// Resolve the NATS pool name, constrained to a specific logical pool.
@@ -406,6 +592,7 @@ mod tests {
             queue_depth: None,
             memory_used_bytes: None,
             memory_total_bytes: None,
+            saturated: false,
         }
     }
 
@@ -435,13 +622,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_worker_not_ready_stays_unknown() {
+    async fn test_update_worker_first_seen_not_ready_stays_unknown() {
         let reg = registry();
         let became = reg.update_worker("http://w1:8080", make_msg(false)).await;
         assert!(!became);
 
+        // A never-Healthy worker reporting `ready: false` is still starting up
+        // (issue #1025 readiness): it stays `Unknown` — not dispatchable, but
+        // not yet a regression — rather than being demoted to `Unhealthy`.
         let workers = reg.workers().await;
         assert_eq!(workers["http://w1:8080"].health, WorkerHealth::Unknown);
+    }
+
+    #[tokio::test]
+    async fn test_update_worker_ready_false_demotes_healthy_immediately() {
+        // Regression: a worker already `Healthy` that heartbeats
+        // `ready: false` must be demoted right away (not left in the
+        // dispatch set until heartbeat timeout) and must fire the degrade
+        // callback on the falling edge so the HRW ring cache invalidates.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let degrade_calls = Arc::new(AtomicUsize::new(0));
+        let degrade_clone = degrade_calls.clone();
+        let reg = WorkerRegistry::with_callbacks(
+            Duration::from_secs(30),
+            None,
+            Some(Arc::new(move |_w: &WorkerState| {
+                degrade_clone.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+
+        // First heartbeat: ready → Healthy, in the dispatch set.
+        reg.update_worker("http://w1:8080", make_msg(true)).await;
+        assert_eq!(reg.healthy_workers().await.len(), 1);
+        assert_eq!(degrade_calls.load(Ordering::SeqCst), 0);
+
+        // Second heartbeat: ready=false → demoted to Unhealthy, removed
+        // from the dispatch set, degrade callback fired exactly once.
+        let became = reg.update_worker("http://w1:8080", make_msg(false)).await;
+        assert!(!became);
+        assert_eq!(
+            reg.workers().await["http://w1:8080"].health,
+            WorkerHealth::Unhealthy
+        );
+        assert!(reg.healthy_workers().await.is_empty());
+        assert_eq!(degrade_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_update_worker_saturation_rising_edge_fires_degrade_once() {
+        // The saturation falling edge (eligible → saturated) must still
+        // fire the degrade callback exactly once, and not double-fire on
+        // a repeated saturated heartbeat.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let degrade_calls = Arc::new(AtomicUsize::new(0));
+        let degrade_clone = degrade_calls.clone();
+        let reg = WorkerRegistry::with_callbacks(
+            Duration::from_secs(30),
+            None,
+            Some(Arc::new(move |_w: &WorkerState| {
+                degrade_clone.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+
+        reg.update_worker("http://w1:8080", make_msg(true)).await;
+        assert_eq!(degrade_calls.load(Ordering::SeqCst), 0);
+
+        let mut sat = make_msg(true);
+        sat.saturated = true;
+        reg.update_worker("http://w1:8080", sat).await;
+        assert_eq!(degrade_calls.load(Ordering::SeqCst), 1);
+
+        // Still saturated on the next heartbeat — no new falling edge.
+        let mut sat2 = make_msg(true);
+        sat2.saturated = true;
+        reg.update_worker("http://w1:8080", sat2).await;
+        assert_eq!(degrade_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_update_worker_healthy_then_not_ready_downgrades() {
+        // A worker that was serving and then reports ready=false has regressed
+        // (e.g. a wedged GPU per issue #1025, or draining for shutdown). The
+        // gateway must stop advertising it as healthy even though heartbeats
+        // keep arriving, so cluster-status and routing reflect reality.
+        let reg = registry();
+        reg.update_worker("http://w1:8080", make_msg(true)).await;
+        assert_eq!(
+            reg.workers().await["http://w1:8080"].health,
+            WorkerHealth::Healthy
+        );
+
+        let became = reg.update_worker("http://w1:8080", make_msg(false)).await;
+        assert!(!became);
+        assert_eq!(
+            reg.workers().await["http://w1:8080"].health,
+            WorkerHealth::Unhealthy
+        );
+
+        // A second (and every subsequent) not-ready heartbeat must keep the
+        // worker Unhealthy rather than flipping it to Unknown, so cluster-status
+        // keeps showing a persistently wedged worker as regressed (#1025).
+        let became = reg.update_worker("http://w1:8080", make_msg(false)).await;
+        assert!(!became);
+        assert_eq!(
+            reg.workers().await["http://w1:8080"].health,
+            WorkerHealth::Unhealthy
+        );
     }
 
     #[tokio::test]
@@ -534,6 +820,7 @@ mod tests {
             queue_depth: Some(7),
             memory_used_bytes: Some(2000),
             memory_total_bytes: Some(8000),
+            saturated: false,
         };
         reg.update_worker("http://w1:8080", msg).await;
 
@@ -560,6 +847,7 @@ mod tests {
             queue_depth: None,
             memory_used_bytes: None,
             memory_total_bytes: None,
+            saturated: false,
         };
         reg.update_worker("http://w1:8080", msg).await;
 
@@ -681,6 +969,96 @@ mod tests {
         reg.update_worker("http://w3:8080", msg3).await;
     }
 
+    // ── dispatch_workers_for / profile-variant routing ─────────────
+
+    #[test]
+    fn test_base_model_id_strips_profile_suffix() {
+        assert_eq!(base_model_id("BAAI/bge-m3"), "BAAI/bge-m3");
+        assert_eq!(base_model_id("BAAI/bge-m3:fast"), "BAAI/bge-m3");
+        // Only the first `:` separates the profile; HF ids never contain `:`.
+        assert_eq!(base_model_id("org/model:a:b"), "org/model");
+        assert_eq!(base_model_id(""), "");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_workers_for_profile_variant_matches_base_worker() {
+        let reg = registry();
+        // A worker advertising only the *base* model name in a named pool.
+        let mut msg = make_msg(true);
+        msg.name = "w1".into();
+        msg.pool_name = "default".into();
+        msg.loaded_models = vec!["BAAI/bge-m3".into()];
+        reg.update_worker("http://w1:8080", msg).await;
+
+        // A `:profile` request must direct-dispatch to the base-model
+        // worker rather than fall through to the pool.
+        let direct = reg.dispatch_workers_for("BAAI/bge-m3:fast", "default");
+        assert_eq!(direct.len(), 1, "profile variant should match base worker");
+        assert_eq!(direct[0].name, "w1");
+
+        // The bare base id still works (regression guard).
+        let base = reg.dispatch_workers_for("BAAI/bge-m3", "default");
+        assert_eq!(base.len(), 1);
+
+        // The ring snapshot (built from the same filter) is non-empty,
+        // so HRW can pick a worker for the profile variant.
+        let ring = reg.ring_snapshot_for("BAAI/bge-m3:fast", "default");
+        assert_eq!(ring.len(), 1);
+
+        // An unknown base id still finds nothing.
+        assert!(reg
+            .dispatch_workers_for("unknown/model:fast", "default")
+            .is_empty());
+    }
+
+    // ── ring_snapshot_for dedup ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_ring_snapshot_dedups_duplicate_worker_names() {
+        let reg = registry();
+        // Two distinct workers (different urls) advertising the SAME
+        // operator-set name in the same (model, pool).
+        let mut a = make_msg(true);
+        a.name = "dup".into();
+        a.pool_name = "default".into();
+        a.loaded_models = vec!["BAAI/bge-m3".into()];
+        reg.update_worker("http://w-z:8080", a).await;
+
+        let mut b = make_msg(true);
+        b.name = "dup".into();
+        b.pool_name = "default".into();
+        b.loaded_models = vec!["BAAI/bge-m3".into()];
+        reg.update_worker("http://w-a:8080", b).await;
+
+        // Both are dispatch-eligible…
+        assert_eq!(reg.dispatch_workers_for("BAAI/bge-m3", "default").len(), 2);
+        // …but the ring collapses them to a single deterministic entry so
+        // the HRW pick is unambiguous and only one per-worker subject is
+        // targeted.
+        let ring = reg.ring_snapshot_for("BAAI/bge-m3", "default");
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring.entries[0].worker_id, "dup");
+    }
+
+    #[tokio::test]
+    async fn test_ring_snapshot_keeps_distinct_names() {
+        let reg = registry();
+        let mut a = make_msg(true);
+        a.name = "w-a".into();
+        a.pool_name = "default".into();
+        a.loaded_models = vec!["BAAI/bge-m3".into()];
+        reg.update_worker("http://w1:8080", a).await;
+
+        let mut b = make_msg(true);
+        b.name = "w-b".into();
+        b.pool_name = "default".into();
+        b.loaded_models = vec!["BAAI/bge-m3".into()];
+        reg.update_worker("http://w2:8080", b).await;
+
+        let ring = reg.ring_snapshot_for("BAAI/bge-m3", "default");
+        assert_eq!(ring.len(), 2);
+    }
+
     // ── get_models ─────────────────────────────────────────────────
 
     #[tokio::test]
@@ -779,7 +1157,7 @@ mod tests {
         assert_eq!(status.workers.len(), 3);
     }
 
-    // ── resolve_queue_pool ────────────────────────────────────────
+    // ── resolve_queue_pool_matching ───────────────────────────────
 
     #[tokio::test]
     async fn test_resolve_queue_pool_found() {
@@ -790,7 +1168,7 @@ mod tests {
         msg.machine_profile = "l4-spot".into();
         reg.update_worker("http://w1:8080", msg).await;
 
-        let pool = reg.resolve_queue_pool("default", "l4-spot").await;
+        let pool = reg.resolve_queue_pool_matching("default", "l4-spot", None);
         assert_eq!(pool, Some("pool-a".to_string()));
     }
 
@@ -831,7 +1209,7 @@ mod tests {
         reg.update_worker("http://w1:8080", msg).await;
 
         // No GPU filter
-        let pool = reg.resolve_queue_pool("premium", "").await;
+        let pool = reg.resolve_queue_pool_matching("premium", "", None);
         assert_eq!(pool, Some("pool-b".to_string()));
     }
 
@@ -843,7 +1221,7 @@ mod tests {
         msg.bundle = "default".into();
         reg.update_worker("http://w1:8080", msg).await;
 
-        let pool = reg.resolve_queue_pool("premium", "").await;
+        let pool = reg.resolve_queue_pool_matching("premium", "", None);
         assert!(pool.is_none());
     }
 
@@ -855,7 +1233,7 @@ mod tests {
         msg.bundle = "default".into();
         reg.update_worker("http://w1:8080", msg).await;
 
-        let pool = reg.resolve_queue_pool("default", "").await;
+        let pool = reg.resolve_queue_pool_matching("default", "", None);
         assert!(pool.is_none());
     }
 
@@ -868,7 +1246,137 @@ mod tests {
         reg.update_worker("http://w1:8080", msg).await;
         reg.mark_unhealthy("http://w1:8080").await;
 
-        let pool = reg.resolve_queue_pool("default", "").await;
+        let pool = reg.resolve_queue_pool_matching("default", "", None);
         assert!(pool.is_none());
+    }
+
+    // ── dispatch_workers_for / ring_snapshot_for ───────────────────
+
+    async fn make_dispatch_msg(
+        ready: bool,
+        saturated: bool,
+        pool: &str,
+        models: &[&str],
+    ) -> WorkerStatusMessage {
+        WorkerStatusMessage {
+            name: "w".into(),
+            ready,
+            gpu_count: 1,
+            machine_profile: "l4".into(),
+            pool_name: pool.into(),
+            bundle: "default".into(),
+            bundle_config_hash: String::new(),
+            loaded_models: models.iter().map(|s| (*s).into()).collect(),
+            models: vec![],
+            gpus: vec![],
+            queue_depth: None,
+            memory_used_bytes: None,
+            memory_total_bytes: None,
+            saturated,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_workers_for_filters_by_model_pool_and_saturation() {
+        let reg = registry();
+        let mut a = make_dispatch_msg(true, false, "p1", &["BAAI/bge-m3"]).await;
+        a.name = "worker-a".into();
+        reg.update_worker("http://a:8080", a).await;
+
+        let mut b = make_dispatch_msg(true, true, "p1", &["BAAI/bge-m3"]).await;
+        b.name = "worker-b".into();
+        reg.update_worker("http://b:8080", b).await;
+
+        let mut c = make_dispatch_msg(true, false, "p2", &["BAAI/bge-m3"]).await;
+        c.name = "worker-c".into();
+        reg.update_worker("http://c:8080", c).await;
+
+        let mut d = make_dispatch_msg(true, false, "p1", &["other/model"]).await;
+        d.name = "worker-d".into();
+        reg.update_worker("http://d:8080", d).await;
+
+        let mut e = make_dispatch_msg(false, false, "p1", &["BAAI/bge-m3"]).await;
+        e.name = "worker-e".into();
+        reg.update_worker("http://e:8080", e).await;
+
+        let elig = reg.dispatch_workers_for("BAAI/bge-m3", "p1");
+        let names: Vec<_> = elig.iter().map(|w| w.name.clone()).collect();
+        assert_eq!(names, vec!["worker-a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_ring_snapshot_for_contains_eligible_only() {
+        let reg = registry();
+        for (i, sat) in [false, true, false].iter().enumerate() {
+            let mut m = make_dispatch_msg(true, *sat, "p1", &["m"]).await;
+            m.name = format!("w-{i}");
+            reg.update_worker(&format!("http://h{i}:8080"), m).await;
+        }
+        let snap = reg.ring_snapshot_for("m", "p1");
+        let ids: Vec<_> = snap.entries.iter().map(|e| e.worker_id.clone()).collect();
+        assert!(ids.contains(&"w-0".to_string()));
+        assert!(!ids.contains(&"w-1".to_string()));
+        assert!(ids.contains(&"w-2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_degrade_callback_fires_on_saturation_rising_edge() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_cb = count.clone();
+        let reg = WorkerRegistry::with_callbacks(
+            Duration::from_secs(30),
+            None,
+            Some(Arc::new(move |_w: &WorkerState| {
+                count_cb.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+
+        let msg = make_dispatch_msg(true, false, "p", &["m"]).await;
+        reg.update_worker("http://w:8080", msg).await;
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+
+        let mut sat = make_dispatch_msg(true, true, "p", &["m"]).await;
+        sat.name = "w".into();
+        reg.update_worker("http://w:8080", sat).await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        // Stays saturated: no re-fire.
+        let mut sat2 = make_dispatch_msg(true, true, "p", &["m"]).await;
+        sat2.name = "w".into();
+        reg.update_worker("http://w:8080", sat2).await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        // Drops back to not-saturated: still no degrade fire (only rising edge).
+        let mut clear = make_dispatch_msg(true, false, "p", &["m"]).await;
+        clear.name = "w".into();
+        reg.update_worker("http://w:8080", clear).await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_degrade_callback_fires_on_mark_unhealthy() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_cb = count.clone();
+        let reg = WorkerRegistry::with_callbacks(
+            Duration::from_secs(30),
+            None,
+            Some(Arc::new(move |_w: &WorkerState| {
+                count_cb.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+
+        reg.update_worker(
+            "http://w:8080",
+            make_dispatch_msg(true, false, "p", &["m"]).await,
+        )
+        .await;
+        reg.mark_unhealthy("http://w:8080").await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        // Marking an already-unhealthy worker is a no-op (no double-fire).
+        reg.mark_unhealthy("http://w:8080").await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }
